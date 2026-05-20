@@ -1,0 +1,21 @@
+{
+  "name": "disaster-be",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend REST adapter and data ingestion scripts for the disaster response platform.",
+  "scripts": {
+    "start": "node project/server.js",
+    "dev": "node project/server.js",
+    "init:db": "node project/scripts/initDb.js",
+    "seed:db": "node project/scripts/seedDb.js",
+    "poll:once": "node project/scripts/pollDisasters.js --once",
+    "poll:watch": "node project/scripts/pollDisasters.js --watch"
+  },
+  "dependencies": {
+    "axios": "^1.16.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "sqlite3": "^6.0.1",
+    "xml2js": "^0.6.2"
+  }
+}
