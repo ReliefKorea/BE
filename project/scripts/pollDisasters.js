@@ -17,7 +17,7 @@ const DEFAULT_POLL_INTERVAL_MS = 300000;
 const sources = [
   {
     name: 'wildfire',
-    script: 'wildfire.js',
+    script: 'crawl_wildfire_forest_fd.js',
     table: 'wildfire_data',
     dedupe: 'startyear + startmonth + startday + starttime + location fields'
   },
@@ -32,6 +32,12 @@ const sources = [
     script: 'earthquake.js',
     table: 'earthquake_data',
     dedupe: 'unique index (tmEqk, loc, mt)'
+  },
+  {
+    name: 'naver-news',
+    script: 'naver_news.js',
+    table: 'naver_news',
+    dedupe: 'UNIQUE (disaster_type, disaster_key, link)'
   }
 ];
 
@@ -182,7 +188,7 @@ async function recordIngestionRun(record) {
 function runCollector(source) {
   return new Promise(resolve => {
     const scriptPath = path.join(backendRoot, source.script);
-    const child = spawn(process.execPath, [scriptPath], {
+    const child = spawn(process.execPath, [scriptPath, ...(source.args ?? [])], {
       cwd: backendRoot,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe']

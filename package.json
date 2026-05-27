@@ -9,13 +9,21 @@
     "init:db": "node project/scripts/initDb.js",
     "seed:db": "node project/scripts/seedDb.js",
     "poll:once": "node project/scripts/pollDisasters.js --once",
-    "poll:watch": "node project/scripts/pollDisasters.js --watch"
+    "poll:watch": "node project/scripts/pollDisasters.js --watch",
+    "crawl:wildfire:safekorea": "node crawl_wildfire_safekorea.js",
+    "crawl:wildfire:safekorea:playwright": "node crawl_wildfire_safekorea.js --playwright",
+    "crawl:wildfire:safekorea:cron": "node crawl_wildfire_safekorea.js --cron",
+    "crawl:wildfire:forest": "node crawl_wildfire_forest_fd.js",
+    "crawl:wildfire:forest:cron": "node crawl_wildfire_forest_fd.js --cron"
   },
   "dependencies": {
     "axios": "^1.16.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "sqlite3": "^6.0.1",
-    "xml2js": "^0.6.2"
+    "xml2js": "^0.6.2",
+    "cheerio": "^1.0.0",
+    "node-cron": "^4.2.1",
+    "playwright": "^1.56.1"
   }
 }

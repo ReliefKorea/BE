@@ -219,6 +219,36 @@ function earthquakeSeverity(magnitude) {
   return 'low';
 }
 
+const MIN_DISASTER_INTENSITY = 5;
+const INTENSITY_NUMERALS = [
+  ['\u216B', 12],
+  ['\u216A', 11],
+  ['\u2169', 10],
+  ['\u2168', 9],
+  ['\u2167', 8],
+  ['\u2166', 7],
+  ['\u2165', 6],
+  ['\u2164', 5],
+  ['\u2163', 4],
+  ['\u2162', 3],
+  ['\u2161', 2],
+  ['\u2160', 1]
+];
+
+function earthquakeIntensity(value) {
+  const raw = text(value);
+  const numericMatch = raw.match(/\d+/);
+  if (numericMatch) return Number(numericMatch[0]);
+
+  const match = INTENSITY_NUMERALS.find(([numeral]) => raw.includes(numeral));
+  return match ? match[1] : null;
+}
+
+function isDisasterEarthquake(row) {
+  const intensity = earthquakeIntensity(row.inT);
+  return intensity !== null && intensity >= MIN_DISASTER_INTENSITY;
+}
+
 function wildfireSeverity(damageArea) {
   const area = number(damageArea) ?? 0;
   if (area >= 10) return 'critical';
@@ -302,11 +332,14 @@ function mapEarthquake(row) {
   const lat = number(row.lat);
   const lng = number(row.lon);
   if (!hasUsableCoords(lat, lng)) return null;
+  if (!isDisasterEarthquake(row)) return null;
 
   const startedAt = isoFromCompactDateTime(row.tmEqk || row.tmFc);
   const updatedAt = isoFromCompactDateTime(row.tmFc || row.tmEqk);
   const location = text(row.loc, '위치 정보 없음');
   const magnitude = number(row.mt) ?? 0;
+  const intensity = earthquakeIntensity(row.inT);
+  const severity = earthquakeSeverity(magnitude);
 
   return {
     event_id: `earthquake_${row.id}`,
@@ -315,7 +348,7 @@ function mapEarthquake(row) {
     region_name: location,
     center_lat: lat,
     center_lng: lng,
-    severity: earthquakeSeverity(magnitude),
+    severity: intensity >= MIN_DISASTER_INTENSITY && severity === 'low' ? 'medium' : severity,
     status: statusFromDate(startedAt),
     started_at: startedAt,
     updated_at: updatedAt,
@@ -385,7 +418,6 @@ async function readEvents() {
       SELECT *
       FROM earthquake_data
       ORDER BY tmEqk DESC, id DESC
-      LIMIT 100
     `);
     const wildfireRows = await allOrEmpty(db, `
       SELECT *
@@ -443,6 +475,17 @@ function articleQueryForEvent(event) {
   };
 }
 
+function articleWasPublishedAfterEvent(row, event) {
+  const publishedAt = new Date(isoFromNewsDate(row.pubDate || row.saved_at));
+  const startedAt = new Date(event.started_at);
+
+  if (Number.isNaN(publishedAt.getTime()) || Number.isNaN(startedAt.getTime())) {
+    return false;
+  }
+
+  return publishedAt >= startedAt;
+}
+
 function mapArticle(row, eventId) {
   const url = text(row.originallink || row.link, '#');
 
@@ -453,7 +496,8 @@ function mapArticle(row, eventId) {
     title: text(row.title, '제목 없음'),
     published_at: isoFromNewsDate(row.pubDate || row.saved_at),
     summary: text(row.description, ''),
-    url
+    url,
+    image_url: text(row.image_url, '')
   };
 }
 
@@ -473,7 +517,9 @@ async function readArticlesForEvent(eventId) {
 
   try {
     const rows = await allOrEmpty(db, query.sql, query.params);
-    return rows.map(row => mapArticle(row, eventId));
+    return rows
+      .filter(row => articleWasPublishedAfterEvent(row, event))
+      .map(row => mapArticle(row, eventId));
   } finally {
     await closeDatabase(db);
   }
@@ -764,6 +810,145 @@ function mapOfficialUpdate(row) {
   };
 }
 
+const FOREST_FIRE_REPORT_URL = 'https://fd.forest.go.kr/ffas/pubConn/movePage/sub3.do';
+const KMA_TYPHOON_REPORT_URL = 'https://www.weather.go.kr/w/hazard/typhoon/report.do';
+const KMA_EARTHQUAKE_RECENT_URL = 'https://www.weather.go.kr/w/earthquake-volcano/recent.do';
+const SAFE_KOREA_ACTION_GUIDE_BASE_URL = 'https://www.safekorea.go.kr/safekorea-kor/acts/nacts/action-guide.do?menuSn=4';
+
+function safeKoreaGuideUrl(category, title) {
+  return `${SAFE_KOREA_ACTION_GUIDE_BASE_URL}&category=${category}&actsHeaderTitle=${encodeURIComponent(title)}`;
+}
+
+function formatKoreanDateTime(isoValue) {
+  const date = new Date(isoValue);
+  if (Number.isNaN(date.getTime())) {
+    return '일시 미상';
+  }
+
+  return new Intl.DateTimeFormat('ko-KR', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(date);
+}
+
+function officialUpdate(update) {
+  return {
+    update_id: update.update_id,
+    event_id: update.event_id,
+    source_name: update.source_name,
+    source_type: update.source_type,
+    issued_at: isoFromNewsDate(update.issued_at),
+    title: update.title,
+    summary: update.summary,
+    original_link: update.original_link
+  };
+}
+
+function buildDynamicOfficialUpdates(event) {
+  const eventId = event.event_id;
+  const startedAt = formatKoreanDateTime(event.started_at);
+  const updatedAt = formatKoreanDateTime(event.updated_at);
+
+  if (event.disaster_type === 'wildfire') {
+    return [
+      officialUpdate({
+        update_id: `official_${stableSlug(eventId)}_forest_report`,
+        event_id: eventId,
+        source_name: '산림청 국가산불정보시스템',
+        source_type: '공식 상황 리포트',
+        issued_at: event.updated_at,
+        title: '산불발생정보',
+        summary: `${event.region_name} 산불은 ${startedAt} 발생, ${updatedAt} 기준 상황이 갱신되었습니다. 산림청 원문에서 진화일시, 진행상태, 대응단계를 확인할 수 있습니다.`,
+        original_link: FOREST_FIRE_REPORT_URL
+      }),
+      officialUpdate({
+        update_id: `official_${stableSlug(eventId)}_wildfire_guide`,
+        event_id: eventId,
+        source_name: '국민재난안전포털',
+        source_type: '국민행동요령',
+        issued_at: event.updated_at,
+        title: '산불 국민행동요령',
+        summary: '산불 발생 시 산림과 불길에서 멀리 떨어지고, 재난문자와 지자체 안내를 확인하며, 안전한 장소로 대피해야 합니다.',
+        original_link: safeKoreaGuideUrl('forestFires', '산불')
+      })
+    ];
+  }
+
+  if (event.disaster_type === 'earthquake') {
+    return [
+      officialUpdate({
+        update_id: `official_${stableSlug(eventId)}_earthquake_report`,
+        event_id: eventId,
+        source_name: '기상청',
+        source_type: '공식 지진 리포트',
+        issued_at: event.updated_at,
+        title: '최근 지진 발표 정보',
+        summary: `${event.region_name} 지진은 ${startedAt} 기준으로 기록되었습니다. 기상청 원문에서 발생 위치, 규모, 깊이, 발표시각을 확인할 수 있습니다.`,
+        original_link: KMA_EARTHQUAKE_RECENT_URL
+      }),
+      officialUpdate({
+        update_id: `official_${stableSlug(eventId)}_earthquake_guide`,
+        event_id: eventId,
+        source_name: '국민재난안전포털',
+        source_type: '국민행동요령',
+        issued_at: event.updated_at,
+        title: '지진 국민행동요령',
+        summary: '흔들림이 멈출 때까지 몸을 보호하고, 낙하물과 유리창을 피하며, 안내에 따라 넓은 공간으로 대피해야 합니다.',
+        original_link: safeKoreaGuideUrl('earthquake', '지진')
+      })
+    ];
+  }
+
+  if (event.disaster_type === 'typhoon') {
+    return [
+      officialUpdate({
+        update_id: `official_${stableSlug(eventId)}_typhoon_report`,
+        event_id: eventId,
+        source_name: '기상청',
+        source_type: '공식 태풍 리포트',
+        issued_at: event.updated_at,
+        title: '태풍통보문',
+        summary: `${event.region_name} 태풍 정보는 ${updatedAt} 기준으로 갱신되었습니다. 기상청 원문에서 중심위치, 최대풍속, 이동방향, 예보 경로를 확인할 수 있습니다.`,
+        original_link: KMA_TYPHOON_REPORT_URL
+      }),
+      officialUpdate({
+        update_id: `official_${stableSlug(eventId)}_typhoon_guide`,
+        event_id: eventId,
+        source_name: '국민재난안전포털',
+        source_type: '국민행동요령',
+        issued_at: event.updated_at,
+        title: '태풍 국민행동요령',
+        summary: '태풍 진로와 도달 시간을 확인하고, 저지대와 해안가 접근을 피하며, 강풍 전 시설물을 고정하고 안전한 곳으로 대피해야 합니다.',
+        original_link: safeKoreaGuideUrl('typhoon', '태풍')
+      })
+    ];
+  }
+
+  return [];
+}
+
+function mergeOfficialUpdates(dynamicUpdates, storedUpdates) {
+  const seen = new Set();
+  const merged = [];
+
+  for (const update of [...dynamicUpdates, ...storedUpdates]) {
+    const key = `${update.source_name}:${update.source_type}:${update.title}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    merged.push(update);
+  }
+
+  return merged;
+}
+
 function mapOrganizationAction(row) {
   return {
     org_id: text(row.org_id),
@@ -800,6 +985,9 @@ function mapDonationRecord(row) {
 
 async function readOfficialUpdatesForEvent(eventId) {
   await ensureSeedTablesOnce();
+  const events = await readEvents();
+  const event = events.find(item => item.event_id === eventId);
+  const dynamicUpdates = event ? buildDynamicOfficialUpdates(event) : [];
   const db = openDatabase();
 
   try {
@@ -809,7 +997,7 @@ async function readOfficialUpdatesForEvent(eventId) {
       WHERE event_id = ?
       ORDER BY issued_at DESC, update_id DESC
     `, [eventId]);
-    return rows.map(mapOfficialUpdate);
+    return mergeOfficialUpdates(dynamicUpdates, rows.map(mapOfficialUpdate));
   } finally {
     await closeDatabase(db);
   }

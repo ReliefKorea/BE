@@ -163,10 +163,7 @@ async function ensureNewsSchema(db) {
 }
 
 function normalizeText(value) {
-    return String(value || '')
-        .replace(/<[^>]*>/g, '')
-        .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, '&')
+    return cleanText(value)
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&#39;/g, "'")
@@ -184,6 +181,155 @@ function dateCutoffYmd(sinceDays) {
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}${month}${day}`;
+}
+
+const regionNameMap = {
+    '강원특별자치도': '강원',
+    '강원도': '강원',
+    '전북특별자치도': '전북',
+    '전라북도': '전북',
+    '전라남도': '전남',
+    '충청북도': '충북',
+    '충청남도': '충남',
+    '경상북도': '경북',
+    '경상남도': '경남',
+    '경기도': '경기',
+    '서울특별시': '서울',
+    '부산광역시': '부산',
+    '대구광역시': '대구',
+    '인천광역시': '인천',
+    '광주광역시': '광주',
+    '대전광역시': '대전',
+    '울산광역시': '울산',
+    '세종특별자치시': '세종',
+    '제주특별자치도': '제주'
+};
+
+function normalizeWhitespace(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeRegionName(text) {
+    const value = normalizeWhitespace(text);
+    return regionNameMap[value] || value;
+}
+
+function cleanText(text) {
+    return String(text || '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/&quot;/g, '"')
+        .replace(/&amp;/g, '&')
+        .trim();
+}
+
+function formatWildfireDate(item) {
+    if (!item.startyear || !item.startmonth || !item.startday) {
+        return '';
+    }
+
+    return `${Number(item.startyear)}년 ${Number(item.startmonth)}월 ${Number(item.startday)}일`;
+}
+
+function makeQuery(parts) {
+    return normalizeWhitespace(parts.filter(Boolean).join(' '));
+}
+
+function buildWildfireQueries(item = {}) {
+    const locsi = normalizeRegionName(item.locsi);
+    const locgungu = normalizeWhitespace(item.locgungu);
+    const locmenu = normalizeWhitespace(item.locmenu);
+    const locdong = normalizeWhitespace(item.locdong);
+    const dateText = formatWildfireDate(item);
+    const candidates = [
+        makeQuery([locsi, locgungu, locmenu, locdong, '산불', dateText]),
+        makeQuery([locgungu, locmenu, locdong, '산불']),
+        makeQuery([locsi, locgungu, '산불']),
+        makeQuery([locgungu, '산불']),
+        makeQuery([locmenu, '산불']),
+        makeQuery([locdong, '산불'])
+    ];
+    const seen = new Set();
+
+    return candidates.filter((query) => {
+        if (!query || query === '산불' || seen.has(query)) {
+            return false;
+        }
+
+        seen.add(query);
+        return true;
+    });
+}
+
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseDisasterDate(value) {
+    const raw = normalizeWhitespace(value);
+    if (!raw) {
+        return null;
+    }
+
+    const compactMatch = raw.match(/^(\d{4})(\d{2})(\d{2})(\d{2})?(\d{2})?(\d{2})?/);
+    if (compactMatch) {
+        const [, year, month, day] = compactMatch;
+        const date = new Date(`${year}-${month}-${day}T00:00:00+09:00`);
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    const textMatch = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+    if (textMatch) {
+        const [, year, month, day] = textMatch;
+        const date = new Date(`${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T00:00:00+09:00`);
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    const date = new Date(raw);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function parseNewsDate(value) {
+    const date = new Date(normalizeWhitespace(value));
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function filterNewsByDisasterDate(candidate, items) {
+    const cutoffDate = parseDisasterDate(candidate.source_time);
+    if (!cutoffDate) {
+        return items;
+    }
+
+    return items.filter((item) => {
+        const pubDate = parseNewsDate(item.pubDate);
+        return pubDate && pubDate >= cutoffDate;
+    });
+}
+
+async function deleteNewsBeforeDisasterDate(db, candidate) {
+    const cutoffDate = parseDisasterDate(candidate.source_time);
+    if (!cutoffDate) {
+        return 0;
+    }
+
+    const rows = await all(db, `
+        SELECT id, pubDate
+        FROM naver_news
+        WHERE disaster_type = ?
+          AND disaster_key = ?
+    `, [candidate.disaster_type, candidate.disaster_key]);
+    let deletedCount = 0;
+
+    for (const row of rows) {
+        const pubDate = parseNewsDate(row.pubDate);
+        if (!pubDate || pubDate >= cutoffDate) {
+            continue;
+        }
+
+        await run(db, 'DELETE FROM naver_news WHERE id = ?', [row.id]);
+        deletedCount += 1;
+    }
+
+    return deletedCount;
 }
 
 function wildfireDateExpression() {
@@ -283,7 +429,7 @@ async function loadWildfireCandidates(db, options) {
     }
 
     const cutoff = dateCutoffYmd(options.sinceDays);
-    const where = ['damagearea >= ?'];
+    const where = ['(damagearea IS NULL OR damagearea >= ?)'];
     const params = [options.minDamageArea];
 
     if (cutoff) {
@@ -293,7 +439,7 @@ async function loadWildfireCandidates(db, options) {
 
     params.push(options.limit);
     const rows = await all(db, `
-        SELECT id, startyear, startmonth, startday, locsi, locgungu, locmenu, locdong, damagearea
+        SELECT id, startyear, startmonth, startday, starttime, locsi, locgungu, locmenu, locdong, locbunji, damagearea
         FROM wildfire_data
         WHERE ${where.join(' AND ')}
         ORDER BY ${wildfireDateExpression()} DESC, damagearea DESC, id DESC
@@ -307,9 +453,18 @@ async function loadWildfireCandidates(db, options) {
             disaster_type: 'wildfire',
             disaster_key: String(row.id),
             source_title: `wildfire damagearea ${row.damagearea || 0}`,
-            source_time: `${row.startyear || ''}-${row.startmonth || ''}-${row.startday || ''}`,
+            source_time: `${row.startyear || ''}-${row.startmonth || ''}-${row.startday || ''}${row.starttime ? ` ${row.starttime}` : ''}`,
             source_location: location,
-            query: `${location} 산불`.trim()
+            query: `${location} 산불`.trim(),
+            startyear: row.startyear,
+            startmonth: row.startmonth,
+            startday: row.startday,
+            starttime: row.starttime,
+            locsi: row.locsi,
+            locgungu: row.locgungu,
+            locmenu: row.locmenu,
+            locdong: row.locdong,
+            locbunji: row.locbunji
         };
     }).filter((candidate) => candidate.query);
 }
@@ -402,6 +557,94 @@ async function fetchNaverNews(candidate, options) {
     return Array.isArray(response.data?.items) ? response.data.items : [];
 }
 
+async function searchNaverNews(query) {
+    const clientId = process.env.NAVER_CLIENT_ID;
+    const clientSecret = process.env.NAVER_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+        throw new Error('NAVER_CLIENT_ID and NAVER_CLIENT_SECRET environment variables are required.');
+    }
+
+    try {
+        const response = await axios.get(NAVER_NEWS_URL, {
+            params: {
+                query,
+                display: 10,
+                start: 1,
+                sort: 'date'
+            },
+            timeout: 5000,
+            headers: {
+                'X-Naver-Client-Id': clientId,
+                'X-Naver-Client-Secret': clientSecret
+            }
+        });
+
+        return Array.isArray(response.data?.items) ? response.data.items : [];
+    } catch (error) {
+        console.error('[naver-news] API request failed:', {
+            status: error.response?.status,
+            data: error.response?.data,
+            query,
+            message: error.message
+        });
+        throw error;
+    }
+}
+
+async function fetchWildfireNewsByLocation(item) {
+    const queries = buildWildfireQueries(item);
+
+    if (queries.length === 0) {
+        console.log('[wildfire-news] No usable location query was created.');
+        return {
+            success: false,
+            queryUsed: null,
+            items: []
+        };
+    }
+
+    for (let index = 0; index < queries.length; index += 1) {
+        const query = queries[index];
+
+        try {
+            const items = filterNewsByDisasterDate(
+                { ...item, query, source_time: item.source_time },
+                await searchNaverNews(query)
+            );
+
+            if (items.length > 0) {
+                return {
+                    success: true,
+                    queryUsed: query,
+                    items: items.map((item) => ({
+                        title: cleanText(item.title),
+                        description: cleanText(item.description),
+                        link: item.originallink || item.link || '',
+                        pubDate: item.pubDate || '',
+                        queryUsed: query
+                    }))
+                };
+            }
+
+            console.log(`[wildfire-news] No results. query="${query}"`);
+        } catch (error) {
+            console.error(`[wildfire-news] Search failed. query="${query}", message=${error.message}`);
+        }
+
+        if (index < queries.length - 1) {
+            await delay(200);
+        }
+    }
+
+    console.log(`[wildfire-news] No news found for wildfire id=${item.id || item.disaster_key || 'unknown'}.`);
+    return {
+        success: false,
+        queryUsed: null,
+        items: []
+    };
+}
+
 function absolutizeUrl(value, baseUrl) {
     if (!value) {
         return '';
@@ -490,7 +733,7 @@ async function saveNews(db, candidate, items) {
                 candidate.source_title,
                 candidate.source_time,
                 candidate.source_location,
-                candidate.query,
+                item.queryUsed || candidate.query,
                 normalizeText(item.title),
                 item.originallink || '',
                 item.link || item.originallink || '',
@@ -523,7 +766,16 @@ async function main() {
         let savedTotal = 0;
 
         for (const candidate of candidates) {
-            const items = await fetchNaverNews(candidate, options);
+            let items;
+            let queryUsed = candidate.query;
+
+            if (candidate.disaster_type === 'wildfire') {
+                const result = await fetchWildfireNewsByLocation(candidate);
+                items = result.items;
+                queryUsed = result.queryUsed || buildWildfireQueries(candidate).join(' | ') || candidate.query;
+            } else {
+                items = filterNewsByDisasterDate(candidate, await fetchNaverNews(candidate, options));
+            }
 
             if (options.images) {
                 for (const item of items) {
@@ -531,11 +783,16 @@ async function main() {
                 }
             }
 
-            const savedCount = await saveNews(db, candidate, items);
+            const deletedOldCount = await deleteNewsBeforeDisasterDate(db, candidate);
+            if (deletedOldCount > 0) {
+                console.log(`[${candidate.disaster_type}] deleted_old=${deletedOldCount}; disaster_key=${candidate.disaster_key}`);
+            }
+
+            const savedCount = await saveNews(db, { ...candidate, query: queryUsed }, items);
 
             fetchedTotal += items.length;
             savedTotal += savedCount;
-            console.log(`[${candidate.disaster_type}] ${candidate.query} fetched=${items.length}, saved=${savedCount}, unchanged=${items.length - savedCount}`);
+            console.log(`[${candidate.disaster_type}] ${queryUsed} fetched=${items.length}, saved=${savedCount}, unchanged=${items.length - savedCount}`);
         }
 
         console.log(`Naver news collection complete. candidates=${candidates.length}, fetched=${fetchedTotal}, saved=${savedTotal}, unchanged=${fetchedTotal - savedTotal}`);
@@ -547,4 +804,17 @@ async function main() {
     }
 }
 
-main();
+if (require.main === module) {
+    main();
+}
+
+module.exports = {
+    normalizeRegionName,
+    buildWildfireQueries,
+    searchNaverNews,
+    cleanText,
+    filterNewsByDisasterDate,
+    deleteNewsBeforeDisasterDate,
+    fetchWildfireNewsByLocation,
+    main
+};

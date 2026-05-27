@@ -173,3 +173,66 @@ Check:
 - frontend `VITE_API_BASE_URL` is `http://localhost:3000/api`
 - browser is not using stale service worker cache
 - `/api/health` returns `{"status":"ok","service":"disaster-be"}`
+
+## Forest Fire Crawler
+
+The current wildfire crawler reads the Korea Forest Service public forest-fire list API:
+
+```text
+https://fd.forest.go.kr/ffas/pubConn/movePage/sub1.do
+https://fd.forest.go.kr/ffas/pubConn/occur/getPublicShowFireInfoList.do
+```
+
+The list API is used because it provides both start time and extinguish time.
+
+### Run
+
+```bash
+npm run crawl:wildfire:forest
+```
+
+The old command is kept as a compatibility wrapper and uses the same Forest Service crawler now:
+
+```bash
+npm run crawl:wildfire:safekorea
+```
+
+### Search Conditions
+
+The crawler requests today's date by default.
+
+Important parameters:
+
+- `startDtm`: search start date, `YYYYMMDD`
+- `endDtm`: search end date, `YYYYMMDD`
+- `prgrsCode`: empty string means all statuses
+
+Keeping `prgrsCode` empty is important. The website's first screen may default to in-progress fires only, but empty status includes completed fires such as `03`.
+
+Optional command examples:
+
+```bash
+node crawl_wildfire_forest_fd.js --date=2026-05-26
+node crawl_wildfire_forest_fd.js --from=2026-05-01 --to=2026-05-26
+node crawl_wildfire_forest_fd.js --status=03
+```
+
+### DB Mapping
+
+The crawler saves rows into the existing `wildfire_data` table.
+
+- `frfr_frng_dtm` -> `startyear`, `startmonth`, `startday`, `starttime`, `startdayofweek`
+- `potfr_end_dtm` -> `endyear`, `endmonth`, `endday`, `endtime`
+- `frfr_sttmn_addr` -> `locsi`, `locgungu`, `locmenu`, `locdong`, `locbunji`
+- status text is not stored because the existing table has no status column
+- missing cause and damage area are stored as `NULL`
+
+The save logic checks exact duplicates first. It also updates an existing row when date, location, and start time match at minute precision, so a previous row like `13:09:40` can receive an end time from a newer source row like `13:09`.
+
+### Scheduling
+
+Use a 5-10 minute interval or slower. Do not send excessive requests to public institution sites.
+
+```bash
+npm run crawl:wildfire:forest:cron
+```
