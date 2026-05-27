@@ -14,11 +14,13 @@ The backend reads disaster data from SQLite, normalizes it for the frontend API 
 ## Setup
 
 ```bash
-npm install
-cp .env.example .env
-npm run init:db
-npm run seed:db
-npm start
+PS C:\Users\...\BE> npm install
+PS C:\Users\...\BE> cp .env.example .env //또는 카카오톡에 올린 .env파일을 ...\BE풀더 안에 넣으세요
+PS C:\Users\...\BE> npm run init:db // DB 파일과 테이블 구조 생성
+PS C:\Users\...\BE> npm run seed:db // 테스트용/기본 계약용 데이터 생성
+PS C:\Users\...\BE> npm run poll:once // 실제 외부 API에서 지진/태풍/산불 데이터를 가져와 DB에 저장
+PS C:\Users\...\BE> npm run poll:watch // (선택사항) regular polling 할 때 실행. 요청주기는 5분
+PS C:\Users\...\BE> npm start 
 ```
 
 On Windows PowerShell, copy the env file with:
