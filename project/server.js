@@ -1342,7 +1342,7 @@ function buildGeneratedDonationAction(event, org, options = {}) {
     activity_type: isCrawled ? '자동 크롤링 후보' : '임시 후원 연결',
     activity_summary: isCrawled
       ? `공식 페이지에서 ${matchedTerms.slice(0, 4).join(', ')} 키워드를 확인해 자동 후보로 연결했습니다. 후원 전 공식 사이트의 모금 대상과 용도를 확인해 주세요.`
-      : '자동 크롤링으로 해당 재난 전용 모금 페이지를 찾지 못해, 재난 구호에 적합한 공식 후원 사이트를 임시로 연결했습니다.',
+      : '공식 구호단체 후원 페이지로 연결됩니다.',
     donation_link: donationLink,
     evidence_note: isCrawled
       ? `공식 페이지 키워드 매칭: ${matchedTerms.join(', ')} / ${options.evidenceUrl}`
