@@ -3,7 +3,10 @@ import cors from 'cors';
 import axios from 'axios';
 import xml2js from 'xml2js';
 import sqlite3 from 'sqlite3';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import path from 'path';
+import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
 import loadEnv from '../loadEnv.js';
 
@@ -18,6 +21,85 @@ const DB_PATH = process.env.DATABASE_PATH
   ? path.resolve(BACKEND_ROOT, process.env.DATABASE_PATH)
   : path.resolve(BACKEND_ROOT, 'data', 'disaster.sqlite');
 const GDACS_API_URL = process.env.GDACS_API_URL || 'https://www.gdacs.org/xml/rss_7d.xml';
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '1h';
+const RELIEF_ORG_DATA_PATH = path.join(BACKEND_ROOT, 'data', 'donation', 'korea_relief_organizations.json');
+const DONATION_CRAWL_TIMEOUT_MS = 4000;
+const DONATION_ORG_CACHE_MS = 60 * 60 * 1000;
+const FALLBACK_RELIEF_ORGANIZATIONS = [
+  {
+    organization_id: 1,
+    name_ko: '희망브리지 전국재해구호협회',
+    relief_category: 'DIRECT_DISASTER_RELIEF',
+    main_focus: '국내 재난·재해 성금 모금, 긴급구호, 임시주거, 심리회복 지원',
+    donation_page_url: 'https://donate.hopebridge.or.kr/',
+    campaign_page_url: 'https://www.hopebridge.or.kr/',
+    source_url: 'https://www.hopebridge.or.kr/',
+    data_confidence: 'HIGH'
+  },
+  {
+    organization_id: 2,
+    name_ko: '사회복지공동모금회 사랑의열매',
+    relief_category: 'NATIONAL_FUNDRAISING_AND_ALLOCATION',
+    main_focus: '사회복지 모금·배분, 캠페인 모금, 지역 기반 지원',
+    donation_page_url: 'https://www.chest.or.kr/',
+    campaign_page_url: 'https://www.chest.or.kr/',
+    source_url: 'https://www.chest.or.kr/',
+    data_confidence: 'HIGH'
+  },
+  {
+    organization_id: 3,
+    name_ko: '굿네이버스',
+    relief_category: 'INTERNATIONAL_HUMANITARIAN_RELIEF',
+    main_focus: '국내외 아동·지역사회 지원, 인도적지원, 캠페인후원',
+    donation_page_url: 'https://www.goodneighbors.kr/',
+    campaign_page_url: 'https://www.goodneighbors.kr/',
+    source_url: 'https://www.goodneighbors.kr/',
+    data_confidence: 'HIGH'
+  },
+  {
+    organization_id: 4,
+    name_ko: '월드비전',
+    relief_category: 'INTERNATIONAL_HUMANITARIAN_RELIEF',
+    main_focus: '긴급구호, 자연재난구호, 해외사업, 국내사업',
+    donation_page_url: 'https://my.worldvision.or.kr/',
+    campaign_page_url: 'https://www.worldvision.or.kr/',
+    source_url: 'https://www.worldvision.or.kr/',
+    data_confidence: 'HIGH'
+  },
+  {
+    organization_id: 6,
+    name_ko: '세이브더칠드런 코리아',
+    relief_category: 'CHILD_HUMANITARIAN_RELIEF',
+    main_focus: '아동권리, 해외 인도적지원, 기후위기대응, 긴급구호',
+    donation_page_url: 'https://www.sc.or.kr/',
+    campaign_page_url: 'https://www.sc.or.kr/',
+    source_url: 'https://www.sc.or.kr/',
+    data_confidence: 'HIGH'
+  },
+  {
+    organization_id: 8,
+    name_ko: '한국해비타트',
+    relief_category: 'DISASTER_HOUSING_REBUILD',
+    main_focus: '주거취약계층 지원, 집고치기, 산불피해 주거 재건',
+    donation_page_url: 'https://donate.habitat.or.kr/',
+    campaign_page_url: 'https://www.habitat.or.kr/',
+    source_url: 'https://www.habitat.or.kr/',
+    data_confidence: 'HIGH'
+  },
+  {
+    organization_id: 9,
+    name_ko: '밀알복지재단',
+    relief_category: 'VULNERABLE_GROUP_HUMANITARIAN_RELIEF',
+    main_focus: '국내 위기가정·장애인지원, 인도적지원사업',
+    donation_page_url: 'https://www.miral.org/',
+    campaign_page_url: 'https://www.miral.org/',
+    source_url: 'https://www.miral.org/',
+    data_confidence: 'HIGH'
+  }
+];
 
 app.set('etag', false);
 app.use(cors());
@@ -35,6 +117,82 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     service: 'disaster-be'
   });
+});
+
+function requireAdminAuth(req, res, next) {
+  const authorization = req.get('Authorization');
+  const match = authorization?.match(/^Bearer ([^\s]+)$/);
+
+  if (!match) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  if (!JWT_SECRET) {
+    res.status(503).json({ error: 'Admin authentication is not configured' });
+    return;
+  }
+
+  try {
+    const payload = jwt.verify(match[1], JWT_SECRET, { algorithms: ['HS256'] });
+
+    if (typeof payload !== 'object' || typeof payload.sub !== 'string' || payload.role !== 'admin') {
+      res.status(401).json({ error: 'Invalid or expired token' });
+      return;
+    }
+
+    req.auth = {
+      username: payload.sub,
+      role: payload.role
+    };
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body ?? {};
+
+  if (
+    typeof username !== 'string' ||
+    !username.trim() ||
+    typeof password !== 'string' ||
+    !password
+  ) {
+    res.status(400).json({ error: 'Username and password are required' });
+    return;
+  }
+
+  if (!ADMIN_USERNAME || !ADMIN_PASSWORD_HASH || !JWT_SECRET) {
+    res.status(503).json({ error: 'Admin authentication is not configured' });
+    return;
+  }
+
+  const passwordMatches = await bcrypt.compare(password, ADMIN_PASSWORD_HASH);
+
+  if (username !== ADMIN_USERNAME || !passwordMatches) {
+    res.status(401).json({ error: 'Invalid username or password' });
+    return;
+  }
+
+  const token = jwt.sign(
+    {
+      sub: username,
+      role: 'admin'
+    },
+    JWT_SECRET,
+    {
+      algorithm: 'HS256',
+      expiresIn: JWT_EXPIRES_IN
+    }
+  );
+
+  res.json({ token });
+});
+
+app.get('/api/auth/me', requireAdminAuth, (req, res) => {
+  res.json(req.auth);
 });
 
 function openDatabase() {
@@ -323,7 +481,7 @@ function mapTyphoon(row) {
     started_at: startedAt,
     updated_at: updatedAt,
     official_summary: `${location} 기준 최대 풍속 ${windSpeed}m/s로 관측 또는 예측되었습니다.`,
-    help_status: 'none',
+    help_status: 'donation_available',
     source_confidence: 'verified'
   };
 }
@@ -353,7 +511,7 @@ function mapEarthquake(row) {
     started_at: startedAt,
     updated_at: updatedAt,
     official_summary: `규모 ${magnitude}, 깊이 ${text(row.dep, '미상')}km 지진 정보입니다.`,
-    help_status: 'none',
+    help_status: 'donation_available',
     source_confidence: 'verified'
   };
 }
@@ -382,7 +540,7 @@ function mapWildfire(row) {
     started_at: startedAt,
     updated_at: updatedAt,
     official_summary: `원인: ${text(row.firecause, '미상')}. 피해 면적은 약 ${damageArea}ha입니다.`,
-    help_status: 'none',
+    help_status: 'donation_available',
     source_confidence: 'verified'
   };
 }
@@ -966,6 +1124,268 @@ function mapOrganizationAction(row) {
   };
 }
 
+let reliefOrganizationsCache = null;
+const generatedDonationOrgCache = new Map();
+
+function normalizeReliefOrganization(raw) {
+  return {
+    organization_id: text(raw.organization_id),
+    name_ko: text(raw.name_ko),
+    relief_category: text(raw.relief_category),
+    main_focus: text(raw.main_focus),
+    donation_page_url: text(raw.donation_page_url),
+    campaign_page_url: text(raw.campaign_page_url),
+    source_url: text(raw.source_url),
+    data_confidence: text(raw.data_confidence, 'UNKNOWN')
+  };
+}
+
+async function readReliefOrganizations() {
+  if (reliefOrganizationsCache) {
+    return reliefOrganizationsCache;
+  }
+
+  try {
+    const raw = await fs.readFile(RELIEF_ORG_DATA_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    reliefOrganizationsCache = Array.isArray(parsed)
+      ? parsed.map(normalizeReliefOrganization).filter(org => org.name_ko && org.donation_page_url)
+      : [];
+  } catch (_) {
+    reliefOrganizationsCache = FALLBACK_RELIEF_ORGANIZATIONS.map(normalizeReliefOrganization);
+  }
+
+  if (reliefOrganizationsCache.length === 0) {
+    reliefOrganizationsCache = FALLBACK_RELIEF_ORGANIZATIONS.map(normalizeReliefOrganization);
+  }
+
+  return reliefOrganizationsCache;
+}
+
+function pageTextFromHtml(html) {
+  return text(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+async function fetchOfficialPageText(url) {
+  if (!url) {
+    return '';
+  }
+
+  try {
+    const response = await axios.get(url, {
+      timeout: DONATION_CRAWL_TIMEOUT_MS,
+      maxRedirects: 3,
+      responseType: 'text',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 ReliefKoreaDonationMatcher/1.0'
+      }
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      return '';
+    }
+
+    return pageTextFromHtml(response.data).slice(0, 300000);
+  } catch (_) {
+    return '';
+  }
+}
+
+function disasterKeywordsForEvent(event) {
+  if (event.disaster_type === 'wildfire') {
+    return ['산불', '화재'];
+  }
+
+  if (event.disaster_type === 'earthquake') {
+    return ['지진', '여진'];
+  }
+
+  if (event.disaster_type === 'typhoon') {
+    return ['태풍', '강풍', '폭풍'];
+  }
+
+  if (event.disaster_type === 'heavy_rain') {
+    return ['호우', '폭우', '수해', '침수'];
+  }
+
+  return ['재난'];
+}
+
+function regionKeywordsForEvent(event) {
+  const region = text(event.region_name);
+  const keywords = new Set();
+
+  for (const name of Object.keys(REGION_COORDS)) {
+    if (region.includes(name)) {
+      keywords.add(name);
+    }
+  }
+
+  for (const part of region.split(/[^\p{Script=Hangul}A-Za-z0-9]+/u)) {
+    if (part.length >= 2 && /[가-힣]/.test(part)) {
+      keywords.add(part);
+    }
+  }
+
+  return [...keywords];
+}
+
+function titleKeywordsForEvent(event) {
+  const blocked = new Set(['발생', '지역', '정보', '기준', '위치', '규모', '태풍', '지진', '산불']);
+  return text(event.title)
+    .split(/[^\p{Script=Hangul}A-Za-z0-9]+/u)
+    .filter(part => part.length >= 2 && /[가-힣]/.test(part) && !blocked.has(part))
+    .slice(0, 6);
+}
+
+function matchedKeywords(pageText, keywords) {
+  return keywords.filter(keyword => pageText.includes(keyword));
+}
+
+function matchDonationPage(pageText, event) {
+  if (!pageText) {
+    return null;
+  }
+
+  const disasterMatches = matchedKeywords(pageText, disasterKeywordsForEvent(event));
+  const regionMatches = matchedKeywords(pageText, regionKeywordsForEvent(event));
+  const titleMatches = matchedKeywords(pageText, titleKeywordsForEvent(event));
+
+  if (disasterMatches.length === 0 || (regionMatches.length === 0 && titleMatches.length === 0)) {
+    return null;
+  }
+
+  return [...new Set([...disasterMatches, ...regionMatches, ...titleMatches])];
+}
+
+function officialPageUrls(org) {
+  return [...new Set([org.campaign_page_url, org.source_url, org.donation_page_url].filter(Boolean))];
+}
+
+async function crawlMatchedDonationOrg(event, org) {
+  for (const url of officialPageUrls(org)) {
+    const pageText = await fetchOfficialPageText(url);
+    const matchedTerms = matchDonationPage(pageText, event);
+
+    if (matchedTerms) {
+      return {
+        org,
+        matchedTerms,
+        evidenceUrl: url
+      };
+    }
+  }
+
+  return null;
+}
+
+function fallbackOrgNamesForEvent(event) {
+  if (event.disaster_type === 'wildfire') {
+    return ['희망브리지 전국재해구호협회', '한국해비타트', '사회복지공동모금회 사랑의열매'];
+  }
+
+  if (event.disaster_type === 'earthquake') {
+    return ['희망브리지 전국재해구호협회', '한국해비타트', '굿네이버스'];
+  }
+
+  if (event.disaster_type === 'typhoon' || event.disaster_type === 'heavy_rain') {
+    return ['희망브리지 전국재해구호협회', '사회복지공동모금회 사랑의열매', '굿네이버스'];
+  }
+
+  return ['희망브리지 전국재해구호협회', '사회복지공동모금회 사랑의열매', '굿네이버스'];
+}
+
+function fallbackDonationOrgs(event, orgs) {
+  const highConfidenceOrgs = orgs.filter(org => org.data_confidence !== 'MEDIUM');
+  const preferredNames = fallbackOrgNamesForEvent(event);
+  const preferred = preferredNames
+    .map(name => highConfidenceOrgs.find(org => org.name_ko === name))
+    .filter(Boolean);
+
+  for (const org of highConfidenceOrgs) {
+    if (preferred.length >= 3) {
+      break;
+    }
+
+    if (!preferred.some(item => item.organization_id === org.organization_id)) {
+      preferred.push(org);
+    }
+  }
+
+  return preferred.slice(0, 3);
+}
+
+function generatedDonationOrgId(eventId, orgId) {
+  return `autoorg_${eventId}__${orgId}`;
+}
+
+function parseGeneratedDonationOrgId(orgId) {
+  const match = text(orgId).match(/^autoorg_(.+)__([^_]+)$/);
+  return match ? { eventId: match[1], organizationId: match[2] } : null;
+}
+
+function buildGeneratedDonationAction(event, org, options = {}) {
+  const isCrawled = options.mode === 'crawled';
+  const matchedTerms = options.matchedTerms ?? [];
+  const donationLink = text(org.donation_page_url, org.campaign_page_url);
+
+  return {
+    org_id: generatedDonationOrgId(event.event_id, org.organization_id),
+    event_id: event.event_id,
+    org_name: org.name_ko,
+    activity_region: event.region_name,
+    activity_type: isCrawled ? '자동 크롤링 후보' : '임시 후원 연결',
+    activity_summary: isCrawled
+      ? `공식 페이지에서 ${matchedTerms.slice(0, 4).join(', ')} 키워드를 확인해 자동 후보로 연결했습니다. 후원 전 공식 사이트의 모금 대상과 용도를 확인해 주세요.`
+      : '자동 크롤링으로 해당 재난 전용 모금 페이지를 찾지 못해, 재난 구호에 적합한 공식 후원 사이트를 임시로 연결했습니다.',
+    donation_link: donationLink,
+    evidence_note: isCrawled
+      ? `공식 페이지 키워드 매칭: ${matchedTerms.join(', ')} / ${options.evidenceUrl}`
+      : '자동 크롤링 후보 없음 - 임시 공식 구호단체 fallback',
+    verified_by_admin: false,
+    last_checked_at: new Date().toISOString()
+  };
+}
+
+async function generatedDonationActionsForEvent(event) {
+  const cached = generatedDonationOrgCache.get(event.event_id);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.organizations;
+  }
+
+  const orgs = (await readReliefOrganizations())
+    .filter(org => org.donation_page_url && org.data_confidence !== 'MEDIUM');
+  const crawlResults = await Promise.all(orgs.map(org => crawlMatchedDonationOrg(event, org)));
+  const crawledOrganizations = crawlResults
+    .filter(Boolean)
+    .slice(0, 3)
+    .map(result => buildGeneratedDonationAction(event, result.org, {
+      mode: 'crawled',
+      matchedTerms: result.matchedTerms,
+      evidenceUrl: result.evidenceUrl
+    }));
+
+  const organizations = crawledOrganizations.length > 0
+    ? crawledOrganizations
+    : fallbackDonationOrgs(event, orgs).map(org => buildGeneratedDonationAction(event, org, { mode: 'fallback' }));
+
+  generatedDonationOrgCache.set(event.event_id, {
+    expiresAt: Date.now() + DONATION_ORG_CACHE_MS,
+    organizations
+  });
+
+  return organizations;
+}
+
+function isSeedOrganizationAction(org) {
+  return org.evidence_note.toLowerCase().includes('seed');
+}
+
 function mapDonationRecord(row) {
   const beneficiaries = number(row.beneficiaries);
   const disasterType = supportedDisasterType(row.disaster_type);
@@ -1014,7 +1434,19 @@ async function readOrganizationsForEvent(eventId) {
       WHERE event_id = ?
       ORDER BY last_checked_at DESC, org_name ASC
     `, [eventId]);
-    return rows.map(mapOrganizationAction);
+    const storedOrganizations = rows.map(mapOrganizationAction);
+    const usableStoredOrganizations = storedOrganizations.filter(org => !isSeedOrganizationAction(org));
+
+    if (usableStoredOrganizations.length > 0) {
+      return usableStoredOrganizations;
+    }
+
+    const event = (await readEvents()).find(item => item.event_id === eventId);
+    if (!event) {
+      return storedOrganizations;
+    }
+
+    return generatedDonationActionsForEvent(event);
   } finally {
     await closeDatabase(db);
   }
@@ -1030,7 +1462,22 @@ async function readOrganizationById(orgId) {
       FROM organization_actions
       WHERE org_id = ?
     `, [orgId]);
-    return row ? mapOrganizationAction(row) : null;
+    if (row) {
+      return mapOrganizationAction(row);
+    }
+
+    const parsedOrgId = parseGeneratedDonationOrgId(orgId);
+    if (!parsedOrgId) {
+      return null;
+    }
+
+    const event = (await readEvents()).find(item => item.event_id === parsedOrgId.eventId);
+    if (!event) {
+      return null;
+    }
+
+    const generatedOrganizations = await generatedDonationActionsForEvent(event);
+    return generatedOrganizations.find(org => org.org_id === orgId) ?? null;
   } finally {
     await closeDatabase(db);
   }
