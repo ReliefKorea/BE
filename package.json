@@ -10,6 +10,7 @@
     "seed:db": "node project/scripts/seedDb.js",
     "poll:once": "node project/scripts/pollDisasters.js --once",
     "poll:watch": "node project/scripts/pollDisasters.js --watch",
+    "rag:orgs": "node project/scripts/runOrgRag.js",
     "crawl:wildfire:safekorea": "node crawl_wildfire_safekorea.js",
     "crawl:wildfire:safekorea:playwright": "node crawl_wildfire_safekorea.js --playwright",
     "crawl:wildfire:safekorea:cron": "node crawl_wildfire_safekorea.js --cron",

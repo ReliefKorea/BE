@@ -6,6 +6,13 @@ import sqlite3 from 'sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import loadEnv from '../loadEnv.js';
+import { ensureRagSchema } from './ai/schema.js';
+import {
+  approveAiReport,
+  listAiReportsForEvent,
+  rejectAiReport,
+  runOrgRag
+} from './ai/ragPipeline.js';
 
 loadEnv();
 
@@ -18,6 +25,15 @@ const DB_PATH = process.env.DATABASE_PATH
   ? path.resolve(BACKEND_ROOT, process.env.DATABASE_PATH)
   : path.resolve(BACKEND_ROOT, 'data', 'disaster.sqlite');
 const GDACS_API_URL = process.env.GDACS_API_URL || 'https://www.gdacs.org/xml/rss_7d.xml';
+const onDemandOrgRagRuns = new Map();
+const backgroundOrgRagRuns = new Map();
+const orgRagRefreshCooldowns = new Map();
+
+const DEFAULT_ORG_RAG_LIMIT = 3;
+const DEFAULT_ORG_RAG_REPORT_TTL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_ORG_RAG_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_ORG_RAG_REFRESH_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_ORG_RAG_REFRESH_COOLDOWN_MS = 30 * 60 * 1000;
 
 app.set('etag', false);
 app.use(cors());
@@ -130,6 +146,22 @@ function booleanFromDb(value) {
 
   const normalized = text(value).toLowerCase();
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function booleanFromEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') return fallback;
+
+  const normalized = String(raw).toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+
+  return fallback;
+}
+
+function numberFromEnv(name, fallback) {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function isoFromKoreanDateTime(value) {
@@ -713,6 +745,8 @@ async function ensureSeedTables() {
         disaster_type TEXT
       )
     `);
+    await ensureRagSchema(db);
+    const seedDemoSupportData = booleanFromEnv('SEED_DEMO_SUPPORT_DATA', false);
 
     if (await countRows(db, 'official_updates') === 0) {
       for (const update of seeds.officialUpdates) {
@@ -734,7 +768,7 @@ async function ensureSeedTables() {
       }
     }
 
-    if (await countRows(db, 'organization_actions') === 0) {
+    if (seedDemoSupportData && await countRows(db, 'organization_actions') === 0) {
       for (const org of seeds.organizationActions) {
         await run(db, `
           INSERT INTO organization_actions (
@@ -759,7 +793,7 @@ async function ensureSeedTables() {
       }
     }
 
-    if (await countRows(db, 'donation_records') === 0) {
+    if (seedDemoSupportData && await countRows(db, 'donation_records') === 0) {
       for (const record of seeds.donationRecords) {
         await run(db, `
           INSERT INTO donation_records (
@@ -779,6 +813,7 @@ async function ensureSeedTables() {
         ]);
       }
     }
+
   } finally {
     await closeDatabase(db);
   }
@@ -808,6 +843,23 @@ function mapOfficialUpdate(row) {
     summary: text(row.summary),
     ...(optionalText(row.original_link) ? { original_link: optionalText(row.original_link) } : {})
   };
+}
+
+function parseEvidenceSources(value) {
+  try {
+    const parsed = JSON.parse(text(value, '[]'));
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .map(item => ({
+        title: text(item?.title),
+        url: text(item?.url),
+        source_type: text(item?.source_type || item?.sourceType, 'evidence')
+      }))
+      .filter(item => item.title || item.url);
+  } catch (_) {
+    return [];
+  }
 }
 
 const FOREST_FIRE_REPORT_URL = 'https://fd.forest.go.kr/ffas/pubConn/movePage/sub3.do';
@@ -950,6 +1002,11 @@ function mergeOfficialUpdates(dynamicUpdates, storedUpdates) {
 }
 
 function mapOrganizationAction(row) {
+  const trustScore = row.ai_trust_score === null || row.ai_trust_score === undefined
+    ? null
+    : number(row.ai_trust_score);
+  const evidenceSources = parseEvidenceSources(row.ai_evidence_sources);
+
   return {
     org_id: text(row.org_id),
     event_id: text(row.event_id),
@@ -962,7 +1019,40 @@ function mapOrganizationAction(row) {
     ...(optionalText(row.volunteer_link) ? { volunteer_link: optionalText(row.volunteer_link) } : {}),
     evidence_note: text(row.evidence_note),
     verified_by_admin: booleanFromDb(row.verified_by_admin),
-    last_checked_at: isoFromNewsDate(row.last_checked_at)
+    last_checked_at: isoFromNewsDate(row.last_checked_at),
+    ...(optionalText(row.ai_report_id) ? { ai_report_id: optionalText(row.ai_report_id) } : {}),
+    ...(optionalText(row.ai_trust_level) ? { trust_level: optionalText(row.ai_trust_level) } : {}),
+    ...(trustScore !== null ? { trust_score: trustScore } : {}),
+    ...(optionalText(row.ai_report_summary) ? { report_summary: optionalText(row.ai_report_summary) } : {}),
+    ...(optionalText(row.ai_finance_summary) ? { finance_summary: optionalText(row.ai_finance_summary) } : {}),
+    ...(optionalText(row.ai_risk_notes) ? { risk_notes: optionalText(row.ai_risk_notes) } : {}),
+    ...(evidenceSources.length > 0 ? { evidence_sources: evidenceSources } : {}),
+    ...(optionalText(row.ai_generated_at) ? { report_generated_at: isoFromNewsDate(row.ai_generated_at) } : {})
+  };
+}
+
+function mapAiReport(row) {
+  return {
+    report_id: text(row.report_id),
+    event_id: text(row.event_id),
+    org_id: text(row.org_id),
+    org_name: text(row.org_name),
+    activity_region: text(row.activity_region),
+    activity_type: text(row.activity_type),
+    activity_summary: text(row.activity_summary),
+    ...(optionalText(row.ai_message) ? { ai_message: optionalText(row.ai_message) } : {}),
+    ...(optionalText(row.donation_link) ? { donation_link: optionalText(row.donation_link) } : {}),
+    ...(optionalText(row.volunteer_link) ? { volunteer_link: optionalText(row.volunteer_link) } : {}),
+    evidence_note: text(row.evidence_note),
+    trust_level: text(row.trust_level, 'needs_review'),
+    trust_score: number(row.trust_score) ?? 0,
+    report_summary: text(row.report_summary),
+    finance_summary: text(row.finance_summary),
+    ...(optionalText(row.risk_notes) ? { risk_notes: optionalText(row.risk_notes) } : {}),
+    evidence_sources: parseEvidenceSources(row.evidence_sources),
+    generated_at: isoFromNewsDate(row.generated_at),
+    review_status: text(row.review_status, 'pending'),
+    ...(optionalText(row.reviewed_at) ? { reviewed_at: isoFromNewsDate(row.reviewed_at) } : {})
   };
 }
 
@@ -977,9 +1067,13 @@ function mapDonationRecord(row) {
     title: text(row.title, '제목 없음'),
     ...(optionalText(row.amount) ? { amount: optionalText(row.amount) } : {}),
     ...(beneficiaries !== null ? { beneficiaries } : {}),
+    ...(optionalText(row.beneficiaries_label) ? { beneficiaries_label: optionalText(row.beneficiaries_label) } : {}),
     region: text(row.region),
     description: text(row.description),
-    ...(disasterType ? { disaster_type: disasterType } : {})
+    ...(disasterType ? { disaster_type: disasterType } : {}),
+    ...(optionalText(row.evidence_title) ? { evidence_title: optionalText(row.evidence_title) } : {}),
+    ...(optionalText(row.evidence_url) ? { evidence_url: optionalText(row.evidence_url) } : {}),
+    ...(optionalText(row.evidence_source) ? { evidence_source: optionalText(row.evidence_source) } : {})
   };
 }
 
@@ -1010,14 +1104,263 @@ async function readOrganizationsForEvent(eventId) {
   try {
     const rows = await allOrEmpty(db, `
       SELECT *
-      FROM organization_actions
-      WHERE event_id = ?
+      FROM (
+        SELECT
+          oa.*,
+          ai.report_id AS ai_report_id,
+          ai.trust_level AS ai_trust_level,
+          ai.trust_score AS ai_trust_score,
+          ai.report_summary AS ai_report_summary,
+          ai.finance_summary AS ai_finance_summary,
+          ai.risk_notes AS ai_risk_notes,
+          ai.evidence_sources AS ai_evidence_sources,
+          ai.generated_at AS ai_generated_at
+        FROM organization_actions oa
+        LEFT JOIN org_ai_reports ai
+          ON ai.report_id = (
+            SELECT latest.report_id
+            FROM org_ai_reports latest
+            WHERE latest.event_id = oa.event_id
+              AND latest.org_id = oa.org_id
+              AND latest.review_status = 'approved'
+            ORDER BY latest.generated_at DESC
+            LIMIT 1
+          )
+        WHERE oa.event_id = ?
+
+        UNION ALL
+
+        SELECT
+          ai.org_id,
+          ai.event_id,
+          ai.org_name,
+          ai.activity_region,
+          ai.activity_type,
+          ai.activity_summary,
+          ai.ai_message,
+          ai.donation_link,
+          ai.volunteer_link,
+          ai.evidence_note,
+          0 AS verified_by_admin,
+          COALESCE(ai.reviewed_at, ai.generated_at) AS last_checked_at,
+          ai.report_id AS ai_report_id,
+          ai.trust_level AS ai_trust_level,
+          ai.trust_score AS ai_trust_score,
+          ai.report_summary AS ai_report_summary,
+          ai.finance_summary AS ai_finance_summary,
+          ai.risk_notes AS ai_risk_notes,
+          ai.evidence_sources AS ai_evidence_sources,
+          ai.generated_at AS ai_generated_at
+        FROM org_ai_reports ai
+        WHERE ai.event_id = ?
+          AND ai.review_status = 'approved'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM organization_actions oa
+            WHERE oa.event_id = ai.event_id
+              AND oa.org_id = ai.org_id
+          )
+      )
       ORDER BY last_checked_at DESC, org_name ASC
-    `, [eventId]);
+    `, [eventId, eventId]);
     return rows.map(mapOrganizationAction);
   } finally {
     await closeDatabase(db);
   }
+}
+
+function orgRagOnDemandLimit() {
+  return numberFromEnv('AI_RAG_ON_DEMAND_LIMIT', DEFAULT_ORG_RAG_LIMIT);
+}
+
+function orgRagOnDemandCatalogLimit() {
+  return numberFromEnv('AI_RAG_ON_DEMAND_CATALOG_LIMIT', DEFAULT_ORG_RAG_LIMIT);
+}
+
+function orgRagRefreshLimit() {
+  return numberFromEnv('AI_RAG_REFRESH_LIMIT', orgRagOnDemandLimit());
+}
+
+function orgRagRefreshCatalogLimit() {
+  return numberFromEnv('AI_RAG_REFRESH_CATALOG_LIMIT', orgRagOnDemandCatalogLimit());
+}
+
+async function runOnDemandOrgRagForEvent(eventId) {
+  if (!booleanFromEnv('AI_RAG_AUTO_RUN_ON_EMPTY', true)) {
+    return null;
+  }
+
+  if (onDemandOrgRagRuns.has(eventId)) {
+    return onDemandOrgRagRuns.get(eventId);
+  }
+
+  const runPromise = (async () => {
+    await ensureSeedTablesOnce();
+    const events = await readEvents();
+    const event = events.find(item => item.event_id === eventId);
+
+    if (!event) {
+      return null;
+    }
+
+    const existingOrganizations = await readOrganizationsForEvent(eventId);
+    const db = openWritableDatabase();
+
+    try {
+      return await runOrgRag({
+        db,
+        event,
+        existingOrganizations,
+        options: {
+          autoPublish: true,
+          limit: orgRagOnDemandLimit(),
+          catalogLimit: orgRagOnDemandCatalogLimit(),
+          reportTtlMs: numberFromEnv('AI_RAG_REPORT_TTL_MS', DEFAULT_ORG_RAG_REPORT_TTL_MS)
+        }
+      });
+    } finally {
+      await closeDatabase(db);
+    }
+  })()
+    .catch(error => {
+      console.error(`On-demand organization RAG failed for ${eventId}:`, error.message);
+      return null;
+    })
+    .finally(() => {
+      onDemandOrgRagRuns.delete(eventId);
+    });
+
+  onDemandOrgRagRuns.set(eventId, runPromise);
+  return runPromise;
+}
+
+async function readOrgRagRefreshState(eventId, staleMs) {
+  const db = openDatabase();
+  const staleBefore = new Date(Date.now() - staleMs).toISOString();
+
+  try {
+    const rows = await allOrEmpty(db, `
+      SELECT
+        COUNT(*) AS approved_count,
+        SUM(CASE WHEN generated_at < ? THEN 1 ELSE 0 END) AS stale_count
+      FROM org_ai_reports
+      WHERE event_id = ?
+        AND review_status = 'approved'
+    `, [staleBefore, eventId]);
+    const row = rows[0] || {};
+
+    return {
+      approvedCount: Number(row.approved_count ?? 0),
+      staleCount: Number(row.stale_count ?? 0)
+    };
+  } finally {
+    await closeDatabase(db);
+  }
+}
+
+async function runBackgroundOrgRagForEvent(eventId, { forceReportRefresh = false, reason = 'scheduled' } = {}) {
+  if (backgroundOrgRagRuns.has(eventId)) {
+    return backgroundOrgRagRuns.get(eventId);
+  }
+
+  const runPromise = (async () => {
+    await ensureSeedTablesOnce();
+    const events = await readEvents();
+    const event = events.find(item => item.event_id === eventId);
+
+    if (!event) {
+      return null;
+    }
+
+    const existingOrganizations = await readOrganizationsForEvent(eventId);
+    const db = openWritableDatabase();
+
+    try {
+      const result = await runOrgRag({
+        db,
+        event,
+        existingOrganizations,
+        options: {
+          autoPublish: true,
+          limit: orgRagRefreshLimit(),
+          catalogLimit: orgRagRefreshCatalogLimit(),
+          reportTtlMs: numberFromEnv('AI_RAG_REPORT_TTL_MS', DEFAULT_ORG_RAG_REPORT_TTL_MS),
+          forceReportRefresh,
+          forceEmbeddingRefresh: false
+        }
+      });
+
+      console.log(`Organization RAG ${reason} run completed for ${eventId}: ${result.reports.length} reports`);
+      return result;
+    } finally {
+      await closeDatabase(db);
+    }
+  })()
+    .catch(error => {
+      console.error(`Organization RAG ${reason} run failed for ${eventId}:`, error.message);
+      return null;
+    })
+    .finally(() => {
+      orgRagRefreshCooldowns.set(eventId, Date.now());
+      backgroundOrgRagRuns.delete(eventId);
+    });
+
+  backgroundOrgRagRuns.set(eventId, runPromise);
+  return runPromise;
+}
+
+async function maybeScheduleOrgRagRefreshForEvent(eventId, currentOrganizationCount = 0) {
+  if (!booleanFromEnv('AI_RAG_REFRESH_ENABLED', true)) {
+    return;
+  }
+
+  const targetLimit = orgRagRefreshLimit();
+  const staleMs = numberFromEnv('AI_RAG_REFRESH_STALE_MS', DEFAULT_ORG_RAG_REFRESH_STALE_MS);
+  const cooldownMs = numberFromEnv('AI_RAG_REFRESH_COOLDOWN_MS', DEFAULT_ORG_RAG_REFRESH_COOLDOWN_MS);
+
+  if (targetLimit <= 0 || staleMs <= 0) {
+    return;
+  }
+
+  const lastRunAt = orgRagRefreshCooldowns.get(eventId) || 0;
+  if (Date.now() - lastRunAt < cooldownMs) {
+    return;
+  }
+
+  const state = await readOrgRagRefreshState(eventId, staleMs);
+  const hasStaleReports = state.staleCount > 0;
+  const needsMoreAiCards = currentOrganizationCount > 0 && state.approvedCount < targetLimit;
+
+  if (!hasStaleReports && !needsMoreAiCards) {
+    return;
+  }
+
+  runBackgroundOrgRagForEvent(eventId, {
+    forceReportRefresh: hasStaleReports,
+    reason: hasStaleReports ? 'stale-refresh' : 'fit-candidate-enrichment'
+  });
+}
+
+async function readOrganizationsForEventWithAutoRag(eventId) {
+  const organizations = await readOrganizationsForEvent(eventId);
+  if (organizations.length > 0) {
+    const hasApprovedAiReport = organizations.some(org => org.ai_report_id);
+    if (!hasApprovedAiReport) {
+      await runOnDemandOrgRagForEvent(eventId);
+      const generatedOrganizations = await readOrganizationsForEvent(eventId);
+      if (generatedOrganizations.some(org => org.ai_report_id)) {
+        return generatedOrganizations;
+      }
+    }
+
+    maybeScheduleOrgRagRefreshForEvent(eventId, organizations.length).catch(error => {
+      console.error(`Organization RAG refresh check failed for ${eventId}:`, error.message);
+    });
+    return organizations;
+  }
+
+  await runOnDemandOrgRagForEvent(eventId);
+  return readOrganizationsForEvent(eventId);
 }
 
 async function readOrganizationById(orgId) {
@@ -1027,9 +1370,64 @@ async function readOrganizationById(orgId) {
   try {
     const row = await get(db, `
       SELECT *
-      FROM organization_actions
-      WHERE org_id = ?
-    `, [orgId]);
+      FROM (
+        SELECT
+          oa.*,
+          ai.report_id AS ai_report_id,
+          ai.trust_level AS ai_trust_level,
+          ai.trust_score AS ai_trust_score,
+          ai.report_summary AS ai_report_summary,
+          ai.finance_summary AS ai_finance_summary,
+          ai.risk_notes AS ai_risk_notes,
+          ai.evidence_sources AS ai_evidence_sources,
+          ai.generated_at AS ai_generated_at
+        FROM organization_actions oa
+        LEFT JOIN org_ai_reports ai
+          ON ai.report_id = (
+            SELECT latest.report_id
+            FROM org_ai_reports latest
+            WHERE latest.org_id = oa.org_id
+              AND latest.review_status = 'approved'
+            ORDER BY latest.generated_at DESC
+            LIMIT 1
+          )
+        WHERE oa.org_id = ?
+
+        UNION ALL
+
+        SELECT
+          ai.org_id,
+          ai.event_id,
+          ai.org_name,
+          ai.activity_region,
+          ai.activity_type,
+          ai.activity_summary,
+          ai.ai_message,
+          ai.donation_link,
+          ai.volunteer_link,
+          ai.evidence_note,
+          0 AS verified_by_admin,
+          COALESCE(ai.reviewed_at, ai.generated_at) AS last_checked_at,
+          ai.report_id AS ai_report_id,
+          ai.trust_level AS ai_trust_level,
+          ai.trust_score AS ai_trust_score,
+          ai.report_summary AS ai_report_summary,
+          ai.finance_summary AS ai_finance_summary,
+          ai.risk_notes AS ai_risk_notes,
+          ai.evidence_sources AS ai_evidence_sources,
+          ai.generated_at AS ai_generated_at
+        FROM org_ai_reports ai
+        WHERE ai.org_id = ?
+          AND ai.review_status = 'approved'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM organization_actions oa
+            WHERE oa.org_id = ai.org_id
+          )
+      )
+      ORDER BY last_checked_at DESC
+      LIMIT 1
+    `, [orgId, orgId]);
     return row ? mapOrganizationAction(row) : null;
   } finally {
     await closeDatabase(db);
@@ -1039,18 +1437,182 @@ async function readOrganizationById(orgId) {
 async function readDonationHistoryForOrg(orgId) {
   await ensureSeedTablesOnce();
   const db = openDatabase();
+  let rows = [];
 
   try {
-    const rows = await allOrEmpty(db, `
+    rows = await allOrEmpty(db, `
       SELECT *
       FROM donation_records
       WHERE org_id = ?
       ORDER BY date DESC, record_id DESC
     `, [orgId]);
-    return rows.map(mapDonationRecord);
   } finally {
     await closeDatabase(db);
   }
+
+  if (rows.length > 0) {
+    return rows.map(mapDonationRecord);
+  }
+
+  const organization = await readOrganizationById(orgId);
+  return buildPublicEvidenceDonationRecords(organization);
+}
+
+function buildPublicEvidenceDonationRecords(organization) {
+  if (!organization) return [];
+
+  const orgName = text(organization.org_name).toLowerCase();
+  const orgSlug = stableSlug(organization.org_id);
+
+  if (orgName.includes('대한적십자사') || orgName.includes('korean red cross')) {
+    return [
+      {
+        record_id: `public_${orgSlug}_gwangju_2024_campaign`,
+        org_id: organization.org_id,
+        date: '2025-08-11',
+        title: '광주전남 희망풍차 모금액 및 사용계획 공시',
+        amount: '₩2,021,555,604',
+        region: '광주·전남',
+        description: '모금기간 2024.08.01~2025.07.31 기준 모금액 2,021,555,604원입니다. 공시된 사용계획은 국내 재난구호와 위기가정 긴급지원(주거·생계·의료비 등)입니다.',
+        evidence_title: '대한적십자사 광주전남지사 2024 기부금품 모집기간 종료 안내',
+        evidence_url: 'https://redcross.or.kr/gwangju/news_notice.do?action=detail&brdctsno=296980',
+        evidence_source: '대한적십자사 광주전남지사'
+      },
+      {
+        record_id: `public_${orgSlug}_seoul_2024_crisis_households`,
+        org_id: organization.org_id,
+        date: '2024-06-30',
+        title: '서울지사 위기가정 긴급지원 실적',
+        amount: '₩162,000,000',
+        beneficiaries: 81,
+        beneficiaries_label: '지원 세대',
+        region: '서울',
+        description: '2024년 상반기 위기가정 81세대에 1억 6천2백만 원을 지원한 실적입니다. 갑작스러운 위기 가정의 극복과 자립을 위한 희망풍차 긴급지원 사업 기록입니다.',
+        evidence_title: '대한적십자사 서울지사 하반기 위기가정 긴급지원 보도자료',
+        evidence_url: 'https://festival.redcross.or.kr/seoul/news_local.do?action=detail&brdctsno=283128&pagenum=24&search_businessdeptcode=&search_jisacode=&search_keyword=&search_option=',
+        evidence_source: '대한적십자사 서울지사'
+      },
+      {
+        record_id: `public_${orgSlug}_busan_2024_fee_campaign`,
+        org_id: organization.org_id,
+        date: '2024-02-01',
+        title: '부산지사 2024 적십자회비 집중모금',
+        amount: '₩1,880,000,000',
+        region: '부산',
+        description: '2024년도 1차 집중모금으로 약 18억 8천만 원을 모금했고, 목표금액 약 23억 6천만 원 대비 79.6%를 달성했습니다. 적십자회비는 재난을 당한 이웃과 소외계층 지원에 사용됩니다.',
+        evidence_title: '대한적십자사 부산지사 2024년도 2차 집중모금 시작 보도자료',
+        evidence_url: 'https://vod.bloodinfo.net/busan/news_local.do?action=detail&brdctsno=278932&pagenum=1&search_businessdeptcode=&search_jisacode=&search_keyword=&search_option=',
+        evidence_source: '대한적십자사 부산지사'
+      }
+    ];
+  }
+
+  if (orgName.includes('희망브리지') || orgName.includes('hopebridge') || orgName.includes('전국재해구호협회')) {
+    return [
+      {
+        record_id: `public_${orgSlug}_hopebridge_2025_fire_relief`,
+        org_id: organization.org_id,
+        date: '2026-01-23',
+        title: '2025년 화재 피해 이웃 맞춤형 구호',
+        amount: '₩480,000,000',
+        beneficiaries: 491,
+        beneficiaries_label: '지원 세대',
+        region: '전국 화재 피해 지역',
+        description: '2025년 한 해 동안 화재 피해 이웃 491세대에 4억 8천만 원 규모의 구호금, 생필품, 구호키트, 주거 연계 지원을 제공한 공개 실적입니다.',
+        disaster_type: 'wildfire',
+        evidence_title: '희망브리지 2025년 화재 피해 이웃 491세대 맞춤형 구호',
+        evidence_url: 'https://hopebridge.or.kr/hope/view.php?b_news_yn=&board_idx=16157&board_type=NTC2&cnt=1236&page=&searchText=&subtitle=',
+        evidence_source: '희망브리지 전국재해구호협회'
+      },
+      {
+        record_id: `public_${orgSlug}_hopebridge_cumulative_support`,
+        org_id: organization.org_id,
+        date: '2026-01-01',
+        title: '누적 성금 및 구호물품 지원 지표',
+        amount: '₩1,600,000,000,000',
+        beneficiaries: 60000000,
+        beneficiaries_label: '구호물품 점수',
+        region: '전국',
+        description: '공식 소개 기준 1961년 이후 1조 6천억 원의 성금과 6천만 점 이상의 구호물품을 지원한 누적 지표입니다.',
+        evidence_title: '희망브리지 소개 및 신뢰성 지표',
+        evidence_url: 'https://hopebridge.or.kr/hope/intro.php',
+        evidence_source: '희망브리지 전국재해구호협회'
+      },
+      {
+        record_id: `public_${orgSlug}_hopebridge_transparency`,
+        org_id: organization.org_id,
+        date: '2026-01-01',
+        title: '감사 및 공익법인 평가 지표',
+        beneficiaries: 5,
+        beneficiaries_label: '한국가이드스타 최고등급 횟수',
+        region: '전국',
+        description: '공식 기업 후원 안내에 매년 외부회계감사 2회, 내부감사 1회, 주무부처 감사 실시와 한국가이드스타 최고 등급 5회를 공개하고 있습니다.',
+        evidence_title: '희망브리지 기업 후원 안내 투명성 지표',
+        evidence_url: 'https://hopebridge.or.kr/support/company.php',
+        evidence_source: '희망브리지 전국재해구호협회'
+      }
+    ];
+  }
+
+  if (orgName.includes('사회복지공동모금회') || orgName.includes('사랑의열매') || orgName.includes('chest')) {
+    return [
+      {
+        record_id: `public_${orgSlug}_chest_2024_fundraising`,
+        org_id: organization.org_id,
+        date: '2025-01-01',
+        title: '2024년 모금 실적 공시',
+        amount: '₩847,700,000,000',
+        beneficiaries: 810338,
+        beneficiaries_label: '개인·법인 기부자',
+        region: '전국',
+        description: '2024년 개인 기부자 773,424명, 법인 기부자 36,914곳을 통해 총 8,477억 원을 모금한 공개 통계입니다.',
+        evidence_title: '사랑의열매 2024년 모금실적 통계자료',
+        evidence_url: 'https://www.chest.or.kr/lf/ct/initDstbpblanc.do',
+        evidence_source: '사회복지공동모금회'
+      },
+      {
+        record_id: `public_${orgSlug}_chest_2024_distribution`,
+        org_id: organization.org_id,
+        date: '2025-01-01',
+        title: '2024년 배분 실적 공시',
+        amount: '₩789,600,000,000',
+        beneficiaries: 671278,
+        beneficiaries_label: '지원 건수',
+        region: '전국',
+        description: '2024년 배분 실적은 총 7,896억 원이며, 기초생계 4,015억 원, 주거·환경 851억 원, 보건·의료 427억 원 등 분야별 지원 금액과 건수를 공개합니다.',
+        evidence_title: '사랑의열매 2024년 배분실적 통계자료',
+        evidence_url: 'https://www.chest.or.kr/lf/ct/initDstbpblanc.do',
+        evidence_source: '사회복지공동모금회'
+      },
+      {
+        record_id: `public_${orgSlug}_chest_2024_management_cost`,
+        org_id: organization.org_id,
+        date: '2025-01-01',
+        title: '2024년 법정관리운영비 집행비율',
+        amount: '₩38,260,000,000',
+        beneficiaries: 461,
+        beneficiaries_label: '관리운영비 비율 bp',
+        region: '전국',
+        description: '2024년 법정관리운영비 집행액은 382억 6천만 원이며, 2023년 모금총액 대비 집행비율은 4.61%로 공시되어 있습니다.',
+        evidence_title: '사랑의열매 2024년 법정관리운영비 집행액',
+        evidence_url: 'https://www.chest.or.kr/lf/ct/initDstbpblanc.do',
+        evidence_source: '사회복지공동모금회'
+      }
+    ];
+  }
+
+  const sources = Array.isArray(organization.evidence_sources) ? organization.evidence_sources : [];
+  return sources.slice(0, 3).map((source, index) => ({
+    record_id: `public_${orgSlug}_evidence_${index + 1}`,
+    org_id: organization.org_id,
+    date: dateOnly(organization.report_generated_at || organization.last_checked_at || new Date().toISOString()),
+    title: `${organization.org_name} 공개 근거 확인`,
+    region: organization.activity_region,
+    description: `${organization.activity_type} 활동과 연결된 공개 근거입니다. 후원금 사용 금액 지표는 원문 공개 자료에서 확인해야 합니다.`,
+    evidence_title: source.title || '공개 근거',
+    evidence_url: source.url || '',
+    evidence_source: source.source_type || 'public_evidence'
+  }));
 }
 
 function parseJsonArray(value) {
@@ -1164,7 +1726,7 @@ app.get('/api/events/:eventId/updates', async (req, res) => {
 
 app.get('/api/events/:eventId/orgs', async (req, res) => {
   try {
-    const organizations = await readOrganizationsForEvent(req.params.eventId);
+    const organizations = await readOrganizationsForEventWithAutoRag(req.params.eventId);
     res.json(organizations);
   } catch (error) {
     console.error('Error reading event organizations:', error.message);
@@ -1204,6 +1766,110 @@ app.get('/api/orgs/:orgId/history', async (req, res) => {
       error: 'Failed to fetch organization history',
       message: error.message
     });
+  }
+});
+
+app.get('/api/admin/events/:eventId/org-reports', async (req, res) => {
+  await ensureSeedTablesOnce();
+  const db = openWritableDatabase();
+
+  try {
+    const reports = await listAiReportsForEvent(db, req.params.eventId);
+    res.json(reports.map(mapAiReport));
+  } catch (error) {
+    console.error('Error reading AI organization reports:', error.message);
+    res.status(500).json({
+      error: 'Failed to fetch AI organization reports',
+      message: error.message
+    });
+  } finally {
+    await closeDatabase(db);
+  }
+});
+
+app.post('/api/admin/events/:eventId/rag/run', async (req, res) => {
+  try {
+    await ensureSeedTablesOnce();
+    const events = await readEvents();
+    const event = events.find(item => item.event_id === req.params.eventId);
+
+    if (!event) {
+      res.status(404).json({ error: 'Event not found' });
+      return;
+    }
+
+    const existingOrganizations = await readOrganizationsForEvent(event.event_id);
+    const db = openWritableDatabase();
+
+    try {
+      const result = await runOrgRag({
+        db,
+        event,
+        existingOrganizations,
+        options: req.body ?? {}
+      });
+      res.status(201).json({
+        ...result,
+        reports: result.reports.map(mapAiReport)
+      });
+    } finally {
+      await closeDatabase(db);
+    }
+  } catch (error) {
+    console.error('Error running organization RAG:', error.message);
+    const isConfigError = error.message?.includes('OPENAI_API_KEY');
+    res.status(isConfigError ? 400 : 500).json({
+      error: isConfigError ? 'OpenAI API key is not configured' : 'Failed to run organization RAG',
+      message: error.message
+    });
+  }
+});
+
+app.post('/api/admin/org-reports/:reportId/approve', async (req, res) => {
+  await ensureSeedTablesOnce();
+  const db = openWritableDatabase();
+
+  try {
+    const report = await approveAiReport(db, req.params.reportId);
+
+    if (!report) {
+      res.status(404).json({ error: 'AI report not found' });
+      return;
+    }
+
+    res.json(mapAiReport(report));
+  } catch (error) {
+    console.error('Error approving AI organization report:', error.message);
+    res.status(500).json({
+      error: 'Failed to approve AI organization report',
+      message: error.message
+    });
+  } finally {
+    await closeDatabase(db);
+  }
+});
+
+app.post('/api/admin/org-reports/:reportId/reject', async (req, res) => {
+  await ensureSeedTablesOnce();
+  const db = openWritableDatabase();
+
+  try {
+    const report = await rejectAiReport(db, req.params.reportId);
+
+    if (!report) {
+      res.status(404).json({ error: 'AI report not found' });
+      return;
+    }
+
+    res.json(mapAiReport(report));
+  } catch (error) {
+    console.error('Error rejecting AI organization report:', error.message);
+    res.status(500).json({
+      error: 'Failed to reject AI organization report',
+      message: error.message
+    });
+  } finally {
+    await closeDatabase(db);
   }
 });
 
@@ -1273,6 +1939,49 @@ app.get('/api/disasters', async (req, res) => {
   }
 });
 
+async function refreshStaleOrgRagReportsOnce() {
+  if (!booleanFromEnv('AI_RAG_REFRESH_ENABLED', true)) {
+    return;
+  }
+
+  const eventLimit = numberFromEnv('AI_RAG_REFRESH_EVENT_LIMIT', 10);
+  if (eventLimit <= 0) {
+    return;
+  }
+
+  const events = await readEvents();
+  for (const event of events.slice(0, eventLimit)) {
+    const organizations = await readOrganizationsForEvent(event.event_id);
+    if (organizations.length === 0) {
+      continue;
+    }
+
+    await maybeScheduleOrgRagRefreshForEvent(event.event_id, organizations.length);
+  }
+}
+
+function startOrgRagRefreshTimer() {
+  if (!booleanFromEnv('AI_RAG_REFRESH_ENABLED', true)) {
+    return;
+  }
+
+  const intervalMs = numberFromEnv('AI_RAG_REFRESH_INTERVAL_MS', DEFAULT_ORG_RAG_REFRESH_INTERVAL_MS);
+  if (intervalMs <= 0) {
+    return;
+  }
+
+  const timer = setInterval(() => {
+    refreshStaleOrgRagReportsOnce().catch(error => {
+      console.error('Scheduled organization RAG refresh failed:', error.message);
+    });
+  }, intervalMs);
+
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
+  startOrgRagRefreshTimer();
 });
