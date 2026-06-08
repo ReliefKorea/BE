@@ -3,8 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "description": "Backend REST adapter and data ingestion scripts for the disaster response platform.",
+  "engines": {
+    "node": "20.x"
+  },
   "scripts": {
     "start": "node project/server.js",
+    "postinstall": "node scripts/rebuildSqlite3ForLinux.js",
     "dev": "node project/server.js",
     "init:db": "node project/scripts/initDb.js",
     "seed:db": "node project/scripts/seedDb.js",
