@@ -60,6 +60,26 @@ const CANDIDATE_CATALOG = [
       earthquake: 15
     },
     fit_reason: '공동모금과 배분 구조를 통해 지역 피해 지원과 복지 안전망 지원으로 연결될 수 있습니다.'
+  },
+  {
+    org_name: '굿네이버스',
+    activity_type: '국내외 재난 긴급구호 및 위기가정 지원',
+    donation_link: 'https://www.goodneighbors.kr/',
+    volunteer_link: '',
+    source_urls: [
+      'https://www.goodneighbors.kr/goodneighbors/management/finance.gn',
+      'https://www.goodneighbors.kr/business/global_relief/emergency.gn',
+      'https://www.goodneighbors.kr/goodneighbors/management/transparency.gn'
+    ],
+    disaster_types: ALL_DISASTER_TYPES,
+    priority: 104,
+    priority_by_type: {
+      wildfire: 30,
+      heavy_rain: 30,
+      typhoon: 30,
+      earthquake: 30
+    },
+    fit_reason: '인도적지원, 국내 위기가정 지원, 긴급구호 사업과 재정보고/투명경영 자료가 공개되어 있습니다.'
   }
 ];
 

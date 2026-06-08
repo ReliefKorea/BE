@@ -111,10 +111,11 @@ const onDemandOrgRagRuns = new Map();
 const backgroundOrgRagRuns = new Map();
 const orgRagRefreshCooldowns = new Map();
 
-const DEFAULT_ORG_RAG_LIMIT = 3;
-const DEFAULT_ORG_RAG_REPORT_TTL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_ORG_RAG_LIMIT = 15;
+const DEFAULT_PUBLIC_ORG_DISPLAY_LIMIT = 3;
+const DEFAULT_ORG_RAG_REPORT_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const DEFAULT_ORG_RAG_REFRESH_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_ORG_RAG_REFRESH_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_COOLDOWN_MS = 30 * 60 * 1000;
 
 app.set('etag', false);
@@ -1376,7 +1377,7 @@ async function crawlMatchedDonationOrg(event, org) {
 
 function fallbackOrgNamesForEvent(event) {
   if (event.disaster_type === 'wildfire') {
-    return ['희망브리지 전국재해구호협회', '한국해비타트', '사회복지공동모금회 사랑의열매'];
+    return ['희망브리지 전국재해구호협회', '굿네이버스', '사회복지공동모금회 사랑의열매'];
   }
 
   if (event.disaster_type === 'earthquake') {
@@ -1581,7 +1582,11 @@ async function readOrganizationsForEvent(eventId) {
               AND oa.org_id = ai.org_id
           )
       )
-      ORDER BY last_checked_at DESC, org_name ASC
+      ORDER BY
+        CASE WHEN ai_report_id IS NULL THEN 1 ELSE 0 END,
+        COALESCE(ai_trust_score, 0) DESC,
+        last_checked_at DESC,
+        org_name ASC
     `, [eventId, eventId]);
     const storedOrganizations = rows.map(mapOrganizationAction);
     const usableStoredOrganizations = storedOrganizations.filter(org => !isSeedOrganizationAction(org));
@@ -1615,6 +1620,19 @@ function orgRagRefreshLimit() {
 
 function orgRagRefreshCatalogLimit() {
   return numberFromEnv('AI_RAG_REFRESH_CATALOG_LIMIT', orgRagOnDemandCatalogLimit());
+}
+
+function publicOrgDisplayLimit() {
+  return numberFromEnv('PUBLIC_ORG_DISPLAY_LIMIT', DEFAULT_PUBLIC_ORG_DISPLAY_LIMIT);
+}
+
+function limitPublicOrganizations(organizations, limit = publicOrgDisplayLimit()) {
+  const normalizedLimit = Number(limit);
+  if (!Number.isFinite(normalizedLimit) || normalizedLimit <= 0) {
+    return [];
+  }
+
+  return organizations.slice(0, normalizedLimit);
 }
 
 async function runOnDemandOrgRagForEvent(eventId) {
@@ -1781,18 +1799,18 @@ async function readOrganizationsForEventWithAutoRag(eventId) {
       await runOnDemandOrgRagForEvent(eventId);
       const generatedOrganizations = await readOrganizationsForEvent(eventId);
       if (generatedOrganizations.some(org => org.ai_report_id)) {
-        return generatedOrganizations;
+        return limitPublicOrganizations(generatedOrganizations);
       }
     }
 
     maybeScheduleOrgRagRefreshForEvent(eventId, organizations.length).catch(error => {
       console.error(`Organization RAG refresh check failed for ${eventId}:`, error.message);
     });
-    return organizations;
+    return limitPublicOrganizations(organizations);
   }
 
   await runOnDemandOrgRagForEvent(eventId);
-  return readOrganizationsForEvent(eventId);
+  return limitPublicOrganizations(await readOrganizationsForEvent(eventId));
 }
 
 async function readOrganizationById(orgId) {
@@ -2044,6 +2062,46 @@ function buildPublicEvidenceDonationRecords(organization) {
         evidence_title: '사랑의열매 2024년 법정관리운영비 집행액',
         evidence_url: 'https://www.chest.or.kr/lf/ct/initDstbpblanc.do',
         evidence_source: '사회복지공동모금회'
+      }
+    ];
+  }
+
+  if (orgName.includes('굿네이버스') || orgName.includes('goodneighbors') || orgName.includes('good neighbors')) {
+    return [
+      {
+        record_id: `public_${orgSlug}_goodneighbors_2025_domestic_emergency`,
+        org_id: organization.org_id,
+        date: '2026-01-01',
+        title: '2025 국내긴급구호사업 결산 지표',
+        amount: '₩5,183,052,624',
+        region: '국내 재난 피해 아동·가정',
+        description: '2025 재정보고 기준 국내긴급구호사업은 재난 피해 아동과 가정의 안전한 회복을 위한 긴급 생계비, 맞춤형 키트, 심리치료 등으로 집행된 공개 지표입니다.',
+        evidence_title: '굿네이버스 2025 재정보고',
+        evidence_url: 'https://www.goodneighbors.kr/goodneighbors/management/finance.gn',
+        evidence_source: '굿네이버스'
+      },
+      {
+        record_id: `public_${orgSlug}_goodneighbors_2025_global_emergency`,
+        org_id: organization.org_id,
+        date: '2026-01-01',
+        title: '2025 해외 긴급구호사업 결산 지표',
+        amount: '₩1,848,971,146',
+        region: '해외 자연재난·분쟁 피해 지역',
+        description: '2025 재정보고 기준 해외 긴급구호사업은 자연 재난, 전쟁 피해, 식량 기근 등 인도적 지원사업으로 집행된 공개 지표입니다.',
+        evidence_title: '굿네이버스 2025 재정보고',
+        evidence_url: 'https://www.goodneighbors.kr/goodneighbors/management/finance.gn',
+        evidence_source: '굿네이버스'
+      },
+      {
+        record_id: `public_${orgSlug}_goodneighbors_2025_humanitarian_relief`,
+        org_id: organization.org_id,
+        date: '2026-01-01',
+        title: '인도적지원 사업 근거',
+        region: '재난 및 분쟁 지역',
+        description: '공식 사업 안내에서 긴급구호 및 재건 복구 활동으로 삶의 터전을 잃은 이웃의 생명 보호와 일상 회복을 돕는다고 공개합니다. 자연재해 대응, 주택·기반시설 재건, 생계 지원을 포함합니다.',
+        evidence_title: '굿네이버스 인도적지원 사업안내',
+        evidence_url: 'https://www.goodneighbors.kr/business/global_relief/emergency.gn',
+        evidence_source: '굿네이버스'
       }
     ];
   }
