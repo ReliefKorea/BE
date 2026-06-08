@@ -9,8 +9,9 @@ loadEnv();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const backendRoot = path.resolve(__dirname, '..', '..');
-const dbPath = process.env.DATABASE_PATH
-  ? path.resolve(backendRoot, process.env.DATABASE_PATH)
+const configuredDbPath = process.env.DB_PATH || process.env.DATABASE_PATH;
+const dbPath = configuredDbPath
+  ? path.resolve(backendRoot, configuredDbPath)
   : path.join(backendRoot, 'data', 'disaster.sqlite');
 const schemaPath = path.join(backendRoot, 'db', 'schema.sql');
 

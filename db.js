@@ -6,9 +6,10 @@ const loadEnv = require('./loadEnv');
 loadEnv();
 
 const dbFolder = path.join(__dirname, 'data');
-const dbPath = process.env.DATABASE_PATH
-    ? path.resolve(__dirname, process.env.DATABASE_PATH)
-    : path.join(dbFolder, 'disaster.sqlite');
+const configuredDbPath = process.env.DB_PATH || process.env.DATABASE_PATH;
+const dbPath = configuredDbPath
+  ? path.resolve(__dirname, configuredDbPath)
+  : path.join(dbFolder, 'disaster.sqlite');
 
 const createWildfireTableSql = `
 CREATE TABLE IF NOT EXISTS wildfire_data (

@@ -24,8 +24,9 @@ const PORT = process.env.PORT || 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const BACKEND_ROOT = path.resolve(__dirname, '..');
-const DB_PATH = process.env.DATABASE_PATH
-  ? path.resolve(BACKEND_ROOT, process.env.DATABASE_PATH)
+const configuredDbPath = process.env.DB_PATH || process.env.DATABASE_PATH;
+const DB_PATH = configuredDbPath
+  ? path.resolve(BACKEND_ROOT, configuredDbPath)
   : path.resolve(BACKEND_ROOT, 'data', 'disaster.sqlite');
 const GDACS_API_URL = process.env.GDACS_API_URL || 'https://www.gdacs.org/xml/rss_7d.xml';
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
@@ -117,9 +118,24 @@ const DEFAULT_ORG_RAG_REPORT_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_COOLDOWN_MS = 30 * 60 * 1000;
+const allowedCorsOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  process.env.FRONTEND_URL
+].filter(Boolean);
 
 app.set('etag', false);
-app.use(cors());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedCorsOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+}));
 app.use(express.json());
 
 app.use('/api', (req, res, next) => {
@@ -2486,7 +2502,7 @@ function startOrgRagRefreshTimer() {
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`Backend server running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Backend server running on http://0.0.0.0:${PORT}`);
   startOrgRagRefreshTimer();
 });
