@@ -70,6 +70,17 @@ function stableSlug(value) {
   return String(value ?? '').trim().replace(/[^A-Za-z0-9_]+/g, '_');
 }
 
+function booleanFromEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') return fallback;
+
+  const normalized = String(raw).toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+
+  return fallback;
+}
+
 async function countRows(db, tableName) {
   const row = await get(db, `SELECT COUNT(*) AS count FROM ${tableName}`);
   return Number(row?.count ?? 0);
@@ -234,6 +245,7 @@ async function seedDb() {
   try {
     await exec(db, schemaSql);
     const seeds = buildSeeds(await firstEventIds(db));
+    const seedDemoSupportData = booleanFromEnv('SEED_DEMO_SUPPORT_DATA', false);
 
     if (await countRows(db, 'official_updates') === 0) {
       for (const update of seeds.officialUpdates) {
@@ -255,7 +267,7 @@ async function seedDb() {
       }
     }
 
-    if (await countRows(db, 'organization_actions') === 0) {
+    if (seedDemoSupportData && await countRows(db, 'organization_actions') === 0) {
       for (const org of seeds.organizationActions) {
         await run(db, `
           INSERT OR IGNORE INTO organization_actions (
@@ -280,7 +292,7 @@ async function seedDb() {
       }
     }
 
-    if (await countRows(db, 'donation_records') === 0) {
+    if (seedDemoSupportData && await countRows(db, 'donation_records') === 0) {
       for (const record of seeds.donationRecords) {
         await run(db, `
           INSERT OR IGNORE INTO donation_records (

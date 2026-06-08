@@ -50,6 +50,10 @@ FLOOD_SERVICE_KEY=
 NAVER_CLIENT_ID=
 NAVER_CLIENT_SECRET=
 YOUTUBE_API_KEY=
+OPENAI_API_KEY=
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+OPENAI_LLM_MODEL=gpt-4o-mini
+OPENAI_API_BASE_URL=https://api.openai.com/v1
 ```
 
 Do not commit real `.env` values. Use `.env.example` for placeholders only.
@@ -69,6 +73,8 @@ Seed minimal contract data:
 ```bash
 npm run seed:db
 ```
+
+By default, seed data does not insert support organizations, donation history, or AI RAG reports. Keep `SEED_DEMO_SUPPORT_DATA=false` so frontend mock fallback data stays separate from the SQLite runtime database. Set it to `true` only for explicit demo fixtures.
 
 Schema source:
 
@@ -114,10 +120,51 @@ Polling uses the existing wildfire, typhoon, and earthquake collection scripts. 
 - `GET /api/events/:eventId/orgs`
 - `GET /api/orgs/:orgId`
 - `GET /api/orgs/:orgId/history`
+- `GET /api/admin/events/:eventId/org-reports`
+- `POST /api/admin/events/:eventId/rag/run`
+- `POST /api/admin/org-reports/:reportId/approve`
+- `POST /api/admin/org-reports/:reportId/reject`
 - `GET /api/ingestion/status`
 - `GET /api/disasters`
 
 `/api/disasters` is the legacy GDACS proxy endpoint and is kept for compatibility.
+
+## Organization RAG
+
+The organization RAG flow is backend-only. Generated reports are auto-published to the public event page when `AI_RAG_AUTO_PUBLISH=true`.
+
+1. Add `OPENAI_API_KEY` to `BE/.env`.
+2. Start the backend with `npm start`.
+3. Run:
+
+```bash
+npm run rag:orgs -- --eventId=<event_id> --limit=3
+```
+
+Generated reports are saved with `review_status=approved` when `AI_RAG_AUTO_PUBLISH=true`, then merged into `GET /api/events/:eventId/orgs` and shown on the frontend cards.
+
+When `AI_RAG_AUTO_RUN_ON_EMPTY=true`, `GET /api/events/:eventId/orgs` runs RAG on demand if no approved AI RAG report exists yet. Existing non-AI organization rows do not block RAG generation. Concurrent requests for the same event share one in-flight run.
+
+Candidate selection and cost controls:
+
+- `AI_RAG_DEFAULT_LIMIT=3` limits default organization candidates per run.
+- `AI_RAG_ON_DEMAND_LIMIT=3` limits event-detail auto-generation to three fit-ranked organizations.
+- `AI_RAG_ON_DEMAND_CATALOG_LIMIT=3` limits auto-generation catalog candidates.
+- `AI_RAG_REUSE_SAME_ORG=true` reuses an approved report for the same organization, donation link, volunteer link, activity type, and disaster type across events.
+- `AI_RAG_CROSS_EVENT_REPORT_TTL_MS=2592000000` keeps same-organization reuse valid for 30 days.
+- `AI_RAG_REPORT_TTL_MS=21600000` reuses reports generated within 6 hours.
+- `AI_RAG_REFRESH_ENABLED=true` enables background refresh for stale or under-filled organization cards.
+- `AI_RAG_REFRESH_INTERVAL_MS=21600000` checks recent events every 6 hours.
+- `AI_RAG_REFRESH_STALE_MS=604800000` regenerates approved AI reports older than 7 days.
+- `AI_RAG_REFRESH_LIMIT=3` and `AI_RAG_REFRESH_CATALOG_LIMIT=3` cap refresh runs to three fit-ranked organizations.
+- `AI_RAG_REFRESH_EVENT_LIMIT=10` limits each scheduled scan to recent events.
+- `AI_RAG_REFRESH_COOLDOWN_MS=1800000` prevents repeated refresh attempts for the same event within 30 minutes.
+- `AI_RAG_MAX_SOURCE_CHARS=6000` caps source text before embedding.
+- `AI_RAG_OFFICIAL_SOURCE_LIMIT=1`, `AI_RAG_SEARCH_QUERY_LIMIT=2`, and `AI_RAG_NEWS_DISPLAY=3` keep retrieval compact.
+- `AI_RAG_FORCE_REFRESH=true` bypasses report and embedding caches only when a fresh full run is needed.
+- `SEED_DEMO_SUPPORT_DATA=false` keeps demo support organizations, donation history, and AI reports out of SQLite so they cannot be mistaken for RAG output.
+
+For local API outage demos, keep `AI_RAG_DUMMY_MODE=auto` in `.env`. In development this keeps the RAG route usable with local fallback analysis.
 
 ## Frontend Connection
 
