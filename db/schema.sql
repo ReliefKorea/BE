@@ -224,6 +224,24 @@ CREATE TABLE IF NOT EXISTS org_ai_reports (
 CREATE INDEX IF NOT EXISTS idx_org_ai_reports_event_status
 ON org_ai_reports (event_id, review_status, generated_at);
 
+CREATE TABLE IF NOT EXISTS event_media_cache (
+  cache_key TEXT PRIMARY KEY,
+  event_id TEXT,
+  category TEXT NOT NULL,
+  region TEXT,
+  image_url TEXT NOT NULL,
+  image_alt TEXT NOT NULL,
+  image_source_name TEXT NOT NULL,
+  image_source_url TEXT,
+  query TEXT,
+  is_fallback INTEGER NOT NULL DEFAULT 0,
+  fetched_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_media_cache_event
+ON event_media_cache (event_id, category, region);
+
 CREATE TABLE IF NOT EXISTS ingestion_runs (
   run_id TEXT PRIMARY KEY,
   started_at TEXT NOT NULL,

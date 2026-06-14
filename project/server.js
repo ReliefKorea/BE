@@ -119,6 +119,58 @@ const DEFAULT_ORG_RAG_REPORT_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_COOLDOWN_MS = 30 * 60 * 1000;
+const DEFAULT_EVENT_MEDIA_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const DEFAULT_MOCK_CATEGORY_RAG_TTL_MS = 72 * 60 * 60 * 1000;
+const CATEGORY_MEDIA_FALLBACKS = {
+  wildfire: {
+    image_url: 'https://images.unsplash.com/photo-1523712999610-f77fbcfc3843?auto=format&fit=crop&w=1800&q=84',
+    image_source_name: 'Unsplash',
+    image_source_url: 'https://unsplash.com',
+    image_alt: '산불 피해 지역의 숲과 연기'
+  },
+  earthquake: {
+    image_url: 'https://images.unsplash.com/photo-1518005020951-eccb494ad742?auto=format&fit=crop&w=1800&q=84',
+    image_source_name: 'Unsplash',
+    image_source_url: 'https://unsplash.com',
+    image_alt: '지진 피해 복구 지원이 필요한 도시 건물'
+  },
+  typhoon: {
+    image_url: 'https://images.unsplash.com/photo-1428592953211-077101b2021b?auto=format&fit=crop&w=1800&q=84',
+    image_source_name: 'Unsplash',
+    image_source_url: 'https://unsplash.com',
+    image_alt: '태풍과 집중호우로 비가 내리는 지역'
+  },
+  heavy_rain: {
+    image_url: 'https://images.unsplash.com/photo-1428592953211-077101b2021b?auto=format&fit=crop&w=1800&q=84',
+    image_source_name: 'Unsplash',
+    image_source_url: 'https://unsplash.com',
+    image_alt: '집중호우로 비가 내리는 지역'
+  },
+  default: {
+    image_url: 'https://images.unsplash.com/photo-1469571486292-0ba58a3f068b?auto=format&fit=crop&w=1800&q=84',
+    image_source_name: 'Unsplash',
+    image_source_url: 'https://unsplash.com',
+    image_alt: '재난 구호 활동에 참여하는 사람들'
+  }
+};
+const ORGANIZATION_MEDIA_FALLBACKS = [
+  {
+    image_url: 'https://images.unsplash.com/photo-1469571486292-0ba58a3f068b?auto=format&fit=crop&w=1200&q=82',
+    image_alt: '지역사회 구호 활동에 참여하는 사람들'
+  },
+  {
+    image_url: 'https://images.unsplash.com/photo-1559027615-cd4628902d4a?auto=format&fit=crop&w=1200&q=82',
+    image_alt: '함께 구호 활동을 준비하는 자원봉사자들'
+  },
+  {
+    image_url: 'https://images.unsplash.com/photo-1593113598332-cd288d649433?auto=format&fit=crop&w=1200&q=82',
+    image_alt: '도움이 필요한 이웃에게 물품을 전달하는 손길'
+  },
+  {
+    image_url: 'https://images.unsplash.com/photo-1532629345422-7515f3d16bb6?auto=format&fit=crop&w=1200&q=82',
+    image_alt: '지역 회복을 위해 힘을 모으는 사람들'
+  }
+];
 const allowedCorsOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
@@ -760,8 +812,210 @@ async function readArticlesForEvent(eventId) {
   }
 }
 
+function disasterTypeLabel(disasterType) {
+  return {
+    wildfire: '산불',
+    earthquake: '지진',
+    typhoon: '태풍',
+    heavy_rain: '호우·홍수'
+  }[disasterType] || '재난';
+}
+
+function eventMediaCacheKey({ eventId, category, region, isMock }) {
+  const scope = isMock ? 'category' : 'event';
+  return `${scope}_${stableCacheSlug(eventId || category)}_${stableCacheSlug(region || 'all')}`.slice(0, 180);
+}
+
+function mapEventMedia(row) {
+  return {
+    image_url: text(row.image_url),
+    image_alt: text(row.image_alt),
+    image_source_name: text(row.image_source_name),
+    image_source_url: text(row.image_source_url),
+    query: text(row.query),
+    is_fallback: booleanFromDb(row.is_fallback),
+    fetched_at: isoFromNewsDate(row.fetched_at),
+    expires_at: isoFromNewsDate(row.expires_at)
+  };
+}
+
+function fallbackEventMedia(category, eventTitle = '') {
+  const fallback = CATEGORY_MEDIA_FALLBACKS[category] || CATEGORY_MEDIA_FALLBACKS.default;
+  return {
+    ...fallback,
+    image_alt: eventTitle ? `${eventTitle} 관련 ${fallback.image_alt}` : fallback.image_alt,
+    query: '',
+    is_fallback: true
+  };
+}
+
+function fallbackOrganizationMedia(orgName, mediaIndex) {
+  if (Number.isInteger(mediaIndex)) {
+    return ORGANIZATION_MEDIA_FALLBACKS[mediaIndex % ORGANIZATION_MEDIA_FALLBACKS.length];
+  }
+
+  const normalized = text(orgName);
+  const hash = [...normalized].reduce(
+    (total, character) => ((total * 31) + character.charCodeAt(0)) >>> 0,
+    0
+  );
+  return ORGANIZATION_MEDIA_FALLBACKS[hash % ORGANIZATION_MEDIA_FALLBACKS.length];
+}
+
+async function searchEventImage(event) {
+  const clientId = process.env.NAVER_CLIENT_ID;
+  const clientSecret = process.env.NAVER_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret || clientId.startsWith('your_') || clientSecret.startsWith('your_')) {
+    return null;
+  }
+
+  const occurredOn = text(event.started_at).slice(0, 10);
+  const query = [
+    event.title,
+    event.region_name,
+    disasterTypeLabel(event.disaster_type),
+    occurredOn,
+    '구호 복구 현장'
+  ].filter(Boolean).join(' ');
+  const url = new URL('https://openapi.naver.com/v1/search/image');
+  url.searchParams.set('query', query);
+  url.searchParams.set('display', '10');
+  url.searchParams.set('sort', 'sim');
+  url.searchParams.set('filter', 'large');
+
+  try {
+    const response = await axios.get(url.toString(), {
+      timeout: numberFromEnv('EVENT_IMAGE_SEARCH_TIMEOUT_MS', 5000),
+      headers: {
+        'X-Naver-Client-Id': clientId,
+        'X-Naver-Client-Secret': clientSecret
+      }
+    });
+    const items = Array.isArray(response.data?.items) ? response.data.items : [];
+    const selected = items.find(item => {
+      const imageUrl = text(item?.link);
+      return /^https?:\/\//.test(imageUrl) && !/\.(gif|svg)(\?|$)/i.test(imageUrl);
+    });
+
+    if (!selected) return null;
+
+    return {
+      image_url: text(selected.link),
+      image_alt: `${event.title} 관련 구호 및 복구 현장 이미지`,
+      image_source_name: '네이버 이미지 검색',
+      image_source_url: `https://search.naver.com/search.naver?where=image&query=${encodeURIComponent(query)}`,
+      query,
+      is_fallback: false
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function upsertEventMedia(cacheKey, event, media, ttlMs) {
+  const fetchedAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const db = openWritableDatabase();
+
+  try {
+    await run(db, `
+      INSERT INTO event_media_cache (
+        cache_key, event_id, category, region, image_url, image_alt, image_source_name,
+        image_source_url, query, is_fallback, fetched_at, expires_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        event_id = excluded.event_id,
+        category = excluded.category,
+        region = excluded.region,
+        image_url = excluded.image_url,
+        image_alt = excluded.image_alt,
+        image_source_name = excluded.image_source_name,
+        image_source_url = excluded.image_source_url,
+        query = excluded.query,
+        is_fallback = excluded.is_fallback,
+        fetched_at = excluded.fetched_at,
+        expires_at = excluded.expires_at
+    `, [
+      cacheKey,
+      event.event_id || '',
+      event.disaster_type,
+      event.region_name || '',
+      media.image_url,
+      media.image_alt,
+      media.image_source_name,
+      media.image_source_url,
+      media.query || '',
+      media.is_fallback ? 1 : 0,
+      fetchedAt,
+      expiresAt
+    ]);
+
+    return {
+      ...media,
+      fetched_at: fetchedAt,
+      expires_at: expiresAt
+    };
+  } finally {
+    await closeDatabase(db);
+  }
+}
+
+async function readEventMedia(request) {
+  const events = request.isMock ? [] : await readEvents();
+  const storedEvent = events.find(item => item.event_id === request.eventId);
+  const event = storedEvent || {
+    event_id: text(request.eventId, `mock_${request.category}`),
+    title: text(request.title, `${disasterTypeLabel(request.category)} 지원 정보`),
+    disaster_type: supportedDisasterType(request.category) || 'wildfire',
+    region_name: text(request.region, '전국'),
+    started_at: text(request.startedAt)
+  };
+  const isMock = Boolean(request.isMock || !storedEvent);
+  const cacheKey = eventMediaCacheKey({
+    eventId: event.event_id,
+    category: event.disaster_type,
+    region: event.region_name,
+    isMock
+  });
+  const db = openDatabase();
+  let cached = null;
+
+  try {
+    cached = await get(db, 'SELECT * FROM event_media_cache WHERE cache_key = ?', [cacheKey]);
+  } finally {
+    await closeDatabase(db);
+  }
+
+  const expiresAt = cached ? new Date(cached.expires_at).getTime() : 0;
+  if (cached && Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+    return mapEventMedia(cached);
+  }
+
+  const searched = isMock ? null : await searchEventImage(event);
+  if (!searched && cached) {
+    return mapEventMedia(cached);
+  }
+
+  const media = searched || fallbackEventMedia(event.disaster_type, event.title);
+  return upsertEventMedia(
+    cacheKey,
+    event,
+    media,
+    numberFromEnv('EVENT_MEDIA_TTL_MS', DEFAULT_EVENT_MEDIA_TTL_MS)
+  );
+}
+
 function stableSlug(value) {
   return text(value).replace(/[^A-Za-z0-9_]+/g, '_');
+}
+
+function stableCacheSlug(value) {
+  return text(value)
+    .normalize('NFKC')
+    .replace(/[^\p{Letter}\p{Number}_]+/gu, '_')
+    .replace(/^_+|_+$/g, '') || 'all';
 }
 
 function firstEventIdByType(events, disasterType, fallbackEventId) {
@@ -770,7 +1024,7 @@ function firstEventIdByType(events, disasterType, fallbackEventId) {
 
 function supportedDisasterType(value) {
   const normalized = text(value);
-  return ['wildfire', 'typhoon', 'earthquake'].includes(normalized) ? normalized : undefined;
+  return ['wildfire', 'typhoon', 'earthquake', 'heavy_rain'].includes(normalized) ? normalized : undefined;
 }
 
 async function countRows(db, tableName) {
@@ -1689,6 +1943,125 @@ function limitPublicOrganizations(organizations, limit = publicOrgDisplayLimit()
   return organizations.slice(0, normalizedLimit);
 }
 
+function donationUseCasesForCategory(category) {
+  return {
+    wildfire: ['임시 거처와 긴급 생필품', '산불 피해 가정 생활 회복', '지역 복구와 심리 지원'],
+    earthquake: ['안전한 임시 대피 공간', '긴급 생활 물품', '주거와 지역 기반시설 복구'],
+    typhoon: ['대피소 식수와 위생용품', '침수 피해 가정 긴급 생계', '주거와 지역 복구'],
+    heavy_rain: ['대피소 식수와 위생용품', '침수 피해 가정 긴급 생계', '주거와 지역 복구']
+  }[category] || ['긴급 생필품', '취약 가정 지원', '지역 회복'];
+}
+
+function enrichOrganizationRecommendation(org, event, { isMockCategoryRecommendation = false, ttlMs, mediaIndex } = {}) {
+  const category = event.disaster_type;
+  const generatedAt = org.report_generated_at || org.last_checked_at || new Date().toISOString();
+  const effectiveTtlMs = ttlMs ?? numberFromEnv('AI_RAG_REPORT_TTL_MS', DEFAULT_ORG_RAG_REPORT_TTL_MS);
+  const expiresAt = new Date(new Date(generatedAt).getTime() + effectiveTtlMs).toISOString();
+  const fallbackMedia = fallbackOrganizationMedia(org.org_name, mediaIndex);
+  const sourceUrls = (org.evidence_sources || []).map(source => source.url).filter(Boolean);
+  const label = disasterTypeLabel(category);
+
+  return {
+    ...org,
+    category,
+    region: event.region_name,
+    summary: org.report_summary || org.ai_message || org.activity_summary,
+    activities: [org.activity_type, org.activity_summary].filter(Boolean),
+    donation_use_cases: donationUseCasesForCategory(category),
+    official_url: org.donation_link || org.volunteer_link,
+    image_url: fallbackMedia.image_url,
+    image_alt: `${org.org_name} 관련 ${fallbackMedia.image_alt}`,
+    image_source_url: 'https://unsplash.com',
+    source_urls: sourceUrls,
+    last_ragged_at: generatedAt,
+    expires_at: expiresAt,
+    is_mock_category_recommendation: isMockCategoryRecommendation,
+    ...(isMockCategoryRecommendation ? {
+      activity_region: event.region_name,
+      activity_type: `${label} 구호 활동 카테고리 추천`
+    } : {})
+  };
+}
+
+function mockCategoryEvent(category, region) {
+  const normalizedCategory = supportedDisasterType(category) || 'wildfire';
+  const normalizedRegion = text(region, '전국');
+
+  return {
+    event_id: `mock_category_${normalizedCategory}_${stableCacheSlug(normalizedRegion)}`.slice(0, 150),
+    title: `${disasterTypeLabel(normalizedCategory)} 구호 활동 카테고리 추천`,
+    disaster_type: normalizedCategory,
+    region_name: normalizedRegion,
+    center_lat: 36.5,
+    center_lng: 127.8,
+    severity: 'medium',
+    status: 'monitoring',
+    started_at: new Date(0).toISOString(),
+    updated_at: new Date().toISOString(),
+    official_summary: `특정 사건 전용 모금이 아닌 ${disasterTypeLabel(normalizedCategory)} 구호 활동 카테고리 기반 추천입니다.`,
+    help_status: 'donation_available',
+    source_confidence: 'monitoring'
+  };
+}
+
+function recommendationsAreFresh(organizations, ttlMs) {
+  if (organizations.length === 0) return false;
+
+  return organizations.some(org => {
+    const generatedAt = new Date(org.report_generated_at || org.last_checked_at).getTime();
+    return Number.isFinite(generatedAt) && Date.now() - generatedAt <= ttlMs;
+  });
+}
+
+async function fallbackCategoryRecommendations(event) {
+  const organizations = await readReliefOrganizations();
+  return fallbackDonationOrgs(event, organizations)
+    .map(org => buildGeneratedDonationAction(event, org, { mode: 'fallback' }));
+}
+
+async function readMockCategoryRecommendations(category, region) {
+  const event = mockCategoryEvent(category, region);
+  const ttlMs = numberFromEnv('AI_RAG_MOCK_CATEGORY_TTL_MS', DEFAULT_MOCK_CATEGORY_RAG_TTL_MS);
+  let organizations = await readOrganizationsForEvent(event.event_id);
+
+  if (!recommendationsAreFresh(organizations, ttlMs)) {
+    const db = openWritableDatabase();
+
+    try {
+      await runOrgRag({
+        db,
+        event,
+        existingOrganizations: [],
+        options: {
+          autoPublish: true,
+          limit: orgRagOnDemandLimit(),
+          catalogLimit: orgRagOnDemandCatalogLimit(),
+          reportTtlMs: ttlMs,
+          forceReportRefresh: organizations.length > 0,
+          forceEmbeddingRefresh: false,
+          skipNews: true
+        }
+      });
+      organizations = await readOrganizationsForEvent(event.event_id);
+    } catch (error) {
+      console.error(`Category organization RAG failed for ${event.event_id}:`, error.message);
+    } finally {
+      await closeDatabase(db);
+    }
+  }
+
+  if (organizations.length === 0) {
+    organizations = await fallbackCategoryRecommendations(event);
+  }
+
+  return limitPublicOrganizations(organizations)
+    .map((org, index) => enrichOrganizationRecommendation(org, event, {
+      isMockCategoryRecommendation: true,
+      ttlMs,
+      mediaIndex: index
+    }));
+}
+
 async function runOnDemandOrgRagForEvent(eventId) {
   if (!booleanFromEnv('AI_RAG_AUTO_RUN_ON_EMPTY', true)) {
     return null;
@@ -2283,10 +2656,47 @@ app.get('/api/events/:eventId/updates', async (req, res) => {
   }
 });
 
+app.get('/api/event-media', async (req, res) => {
+  try {
+    const media = await readEventMedia({
+      eventId: req.query.eventId,
+      title: req.query.title,
+      category: req.query.category,
+      region: req.query.region,
+      startedAt: req.query.startedAt,
+      isMock: booleanFromDb(req.query.isMock)
+    });
+    res.json(media);
+  } catch (error) {
+    console.error('Error reading event media:', error.message);
+    res.status(500).json({
+      error: 'Failed to fetch event media',
+      message: error.message
+    });
+  }
+});
+
+app.get('/api/relief-recommendations', async (req, res) => {
+  try {
+    const organizations = await readMockCategoryRecommendations(req.query.category, req.query.region);
+    res.json(organizations);
+  } catch (error) {
+    console.error('Error reading category relief recommendations:', error.message);
+    res.status(500).json({
+      error: 'Failed to fetch category relief recommendations',
+      message: error.message
+    });
+  }
+});
+
 app.get('/api/events/:eventId/orgs', async (req, res) => {
   try {
     const organizations = await readOrganizationsForEventWithAutoRag(req.params.eventId);
-    res.json(organizations);
+    const events = await readEvents();
+    const event = events.find(item => item.event_id === req.params.eventId);
+    res.json(event
+      ? organizations.map((org, index) => enrichOrganizationRecommendation(org, event, { mediaIndex: index }))
+      : organizations);
   } catch (error) {
     console.error('Error reading event organizations:', error.message);
     res.status(500).json({

@@ -17,7 +17,10 @@ export function stableSlug(value) {
     .replace(/[^A-Za-z0-9_]+/g, '_')
     .replace(/^_+|_+$/g, '');
 
-  return slug || hashText(raw).slice(0, 12);
+  if (!slug) return hashText(raw).slice(0, 12);
+
+  const normalizedRaw = raw.replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+  return normalizedRaw === raw ? slug : `${slug}_${hashText(raw).slice(0, 10)}`;
 }
 
 export function hashText(value) {

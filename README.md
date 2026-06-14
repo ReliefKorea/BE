@@ -126,6 +126,8 @@ Polling uses the existing wildfire, typhoon, and earthquake collection scripts. 
 - `GET /api/events/:eventId/articles`
 - `GET /api/events/:eventId/updates`
 - `GET /api/events/:eventId/orgs`
+- `GET /api/event-media?eventId=&title=&category=&region=&startedAt=&isMock=`
+- `GET /api/relief-recommendations?category=&region=`
 - `GET /api/orgs/:orgId`
 - `GET /api/orgs/:orgId/history`
 - `GET /api/admin/events/:eventId/org-reports`
@@ -161,6 +163,7 @@ Candidate selection and cost controls:
 - `AI_RAG_REUSE_SAME_ORG=true` reuses an approved report for the same organization, donation link, volunteer link, activity type, and disaster type across events.
 - `AI_RAG_CROSS_EVENT_REPORT_TTL_MS=2592000000` keeps same-organization reuse valid for 30 days.
 - `AI_RAG_REPORT_TTL_MS=21600000` reuses reports generated within 6 hours.
+- `AI_RAG_MOCK_CATEGORY_TTL_MS=259200000` keeps mock/category recommendations for 72 hours.
 - `AI_RAG_REFRESH_ENABLED=true` enables background refresh for stale or under-filled organization cards.
 - `AI_RAG_REFRESH_INTERVAL_MS=21600000` checks recent events every 6 hours.
 - `AI_RAG_REFRESH_STALE_MS=604800000` regenerates approved AI reports older than 7 days.
@@ -171,6 +174,16 @@ Candidate selection and cost controls:
 - `AI_RAG_OFFICIAL_SOURCE_LIMIT=1`, `AI_RAG_SEARCH_QUERY_LIMIT=2`, and `AI_RAG_NEWS_DISPLAY=3` keep retrieval compact.
 - `AI_RAG_FORCE_REFRESH=true` bypasses report and embedding caches only when a fresh full run is needed.
 - `SEED_DEMO_SUPPORT_DATA=false` keeps demo support organizations, donation history, and AI reports out of SQLite so they cannot be mistaken for RAG output.
+
+Mock events never run event-specific retrieval. `/api/relief-recommendations` creates a category-and-region cache key, retrieves only organization-level public evidence, and labels every result with `is_mock_category_recommendation=true`.
+
+## Event Media Cache
+
+`/api/event-media` searches for a representative image only for real events, using the event title, region, category, and occurrence date. The selected image URL, source, alt text, query, and expiration time are stored in `event_media_cache`.
+
+- `EVENT_MEDIA_TTL_MS=2592000000` keeps a selected image for 30 days.
+- Mock events skip event-specific image search and use a category fallback image.
+- Failed refreshes keep the previous cached image.
 
 For local API outage demos, keep `AI_RAG_DUMMY_MODE=auto` in `.env`. In development this keeps the RAG route usable with local fallback analysis.
 
