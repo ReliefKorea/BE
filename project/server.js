@@ -5,6 +5,7 @@ import xml2js from 'xml2js';
 import sqlite3 from 'sqlite3';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
 import { fileURLToPath } from 'url';
@@ -34,6 +35,7 @@ const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '1h';
+const POLL_ADMIN_TOKEN = process.env.POLL_ADMIN_TOKEN;
 const RELIEF_ORG_DATA_PATH = path.join(BACKEND_ROOT, 'data', 'donation', 'korea_relief_organizations.json');
 const DONATION_CRAWL_TIMEOUT_MS = 4000;
 const DONATION_ORG_CACHE_MS = 60 * 60 * 1000;
@@ -112,6 +114,7 @@ const FALLBACK_RELIEF_ORGANIZATIONS = [
 const onDemandOrgRagRuns = new Map();
 const backgroundOrgRagRuns = new Map();
 const orgRagRefreshCooldowns = new Map();
+let pollingInProgress = false;
 
 const DEFAULT_ORG_RAG_LIMIT = 15;
 const DEFAULT_PUBLIC_ORG_DISPLAY_LIMIT = 3;
@@ -283,6 +286,84 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', requireAdminAuth, (req, res) => {
   res.json(req.auth);
+});
+
+function runPollingOnceProcess() {
+  return new Promise((resolve, reject) => {
+    const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const child = spawn(npmCommand, ['run', 'poll:once'], {
+      cwd: BACKEND_ROOT,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    child.stdout.on('data', chunk => {
+      process.stdout.write(`[poll-once] ${chunk}`);
+    });
+
+    child.stderr.on('data', chunk => {
+      process.stderr.write(`[poll-once] ${chunk}`);
+    });
+
+    child.on('error', reject);
+
+    child.on('close', code => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      const error = new Error('poll:once failed');
+      error.code = code;
+      reject(error);
+    });
+  });
+}
+
+app.post('/api/admin/poll-once', async (req, res) => {
+  if (!POLL_ADMIN_TOKEN) {
+    res.status(503).json({
+      ok: false,
+      error: 'Polling admin token is not configured'
+    });
+    return;
+  }
+
+  if (req.get('x-poll-token') !== POLL_ADMIN_TOKEN) {
+    res.status(401).json({
+      ok: false,
+      error: 'Unauthorized'
+    });
+    return;
+  }
+
+  if (pollingInProgress) {
+    res.status(409).json({
+      ok: false,
+      error: 'Polling already in progress'
+    });
+    return;
+  }
+
+  pollingInProgress = true;
+
+  try {
+    await runPollingOnceProcess();
+    res.json({
+      ok: true,
+      message: 'Polling completed',
+      ranAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Manual polling failed:', error.message);
+    res.status(500).json({
+      ok: false,
+      error: 'poll:once failed',
+      code: error.code ?? 1
+    });
+  } finally {
+    pollingInProgress = false;
+  }
 });
 
 function openDatabase() {

@@ -4,6 +4,57 @@ Backend REST adapter and data ingestion scripts for the disaster response platfo
 
 The backend reads disaster data from SQLite, normalizes it for the frontend API contract, and exposes Express endpoints under `/api`.
 
+## Professor Test Run Guide
+
+The commands below assume that you are running them from the project root.
+
+### 1. Run with live data
+
+To test with live external API data, start the backend first and then start the frontend.
+
+```powershell
+cd BE
+npm install
+Copy-Item .env.example .env
+npm run init:db
+npm run seed:db
+npm run poll:once
+npm start
+```
+
+In a new PowerShell window, start the frontend.
+
+```powershell
+cd FE
+npm install
+Copy-Item .env.example .env
+npm run dev
+```
+
+Open `http://localhost:5173` in a browser. Live data collection may require external API keys in `BE/.env`.
+
+### 2. Run with mock data when live data is unavailable
+
+If the backend data is empty or API requests fail, the frontend can use the mock data in `FE/src/data/mockData.ts`. Keep the following values in `FE/.env`.
+
+```text
+VITE_API_BASE_URL=http://localhost:3000/api
+VITE_ENABLE_MOCK_FALLBACK=true
+```
+
+The frontend is started with the same commands.
+
+```powershell
+cd FE
+npm install
+Copy-Item .env.example .env
+npm run dev
+```
+
+### 3. Requesting env files for testing
+
+If you need test `.env` files that include the required external API keys, please contact the team representative using the email address included in our submission email.
+
 ## Requirements
 
 - Node.js 18 or newer
@@ -41,7 +92,9 @@ http://localhost:3000/api
 PORT=3000
 NODE_ENV=development
 DATABASE_PATH=./disaster.sqlite
+DB_PATH=
 POLL_INTERVAL_MS=300000
+POLL_ADMIN_TOKEN=
 GDACS_API_URL=
 PUBLIC_DATA_SERVICE_KEY=
 KMA_SERVICE_KEY=
@@ -92,6 +145,7 @@ Railway SQLite database:
 
 ```text
 DB_PATH=/data/disaster.sqlite
+DATABASE_PATH=/data/disaster.sqlite
 ```
 
 Create a Railway Volume on the `BE` service and mount it at `/data`. The server creates the parent directory and applies `db/schema.sql` at startup, so the database file can be created inside the mounted volume before API routes read it.
@@ -116,7 +170,33 @@ Default interval:
 POLL_INTERVAL_MS=300000
 ```
 
-Polling uses the existing wildfire, typhoon, and earthquake collection scripts. It does not run automatically from the Express server.
+Polling uses the existing wildfire, typhoon, earthquake, and Naver news collection scripts.
+
+On Railway, keep the API service as the only service with the SQLite volume. The API service should use:
+
+```text
+Start Command: npm start
+DB_PATH=/data/disaster.sqlite
+DATABASE_PATH=/data/disaster.sqlite
+POLL_ADMIN_TOKEN=<long random secret>
+```
+
+Use a separate Railway Cron trigger service only to wake the API server every 30 minutes:
+
+```text
+Service Name: BE Poll Trigger Cron
+Start Command: curl -X POST "$API_BASE_URL/api/admin/poll-once" -H "x-poll-token: $POLL_ADMIN_TOKEN"
+Cron Schedule: */30 * * * *
+```
+
+Cron trigger variables:
+
+```text
+API_BASE_URL=https://<railway-be-api-domain>
+POLL_ADMIN_TOKEN=<same value as the BE API service>
+```
+
+Do not attach a SQLite volume to the Cron trigger service. Do not run `npm run poll:once` or `npm run poll:watch` directly from the Cron trigger service. The trigger service only sends an authenticated HTTP request; the API server performs the polling and writes to its own `/data/disaster.sqlite` volume.
 
 ## API Endpoints
 
@@ -134,6 +214,7 @@ Polling uses the existing wildfire, typhoon, and earthquake collection scripts. 
 - `POST /api/admin/events/:eventId/rag/run`
 - `POST /api/admin/org-reports/:reportId/approve`
 - `POST /api/admin/org-reports/:reportId/reject`
+- `POST /api/admin/poll-once`
 - `GET /api/ingestion/status`
 - `GET /api/disasters`
 
