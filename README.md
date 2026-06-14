@@ -66,7 +66,7 @@ If you need test `.env` files that include the required external API keys, pleas
 
 ```bash
 PS C:\Users\...\BE> npm install
-PS C:\Users\...\BE> cp .env.example .env //또는 카카오톡에 올린 .env파일을 ...\BE풀더 안에 넣으세요
+PS C:\Users\...\BE> cp .env.example .env //.env파일을 ...\BE풀더 안에 넣으세요
 PS C:\Users\...\BE> npm run init:db // DB 파일과 테이블 구조 생성
 PS C:\Users\...\BE> npm run seed:db // 테스트용/기본 계약용 데이터 생성
 PS C:\Users\...\BE> npm run poll:once // 실제 외부 API에서 지진/태풍/산불 데이터를 가져와 DB에 저장
@@ -92,21 +92,61 @@ http://localhost:3000/api
 PORT=3000
 NODE_ENV=development
 DATABASE_PATH=./disaster.sqlite
+# Railway volume example: DB_PATH=/data/disaster.sqlite
 DB_PATH=
+FRONTEND_URL=http://localhost:5173
+SEED_DEMO_SUPPORT_DATA=false
 POLL_INTERVAL_MS=300000
-POLL_ADMIN_TOKEN=
+
+# Admin authentication
+ADMIN_USERNAME=your_admin_username_here
+ADMIN_PASSWORD_HASH=your_bcrypt_password_hash_here
+JWT_SECRET=your_long_random_jwt_secret_here
+JWT_EXPIRES_IN=1h
+POLL_ADMIN_TOKEN=your_long_random_poll_token_here
+
+# External API keys
 GDACS_API_URL=
-PUBLIC_DATA_SERVICE_KEY=
-KMA_SERVICE_KEY=
-WILDFIRE_SERVICE_KEY=
-FLOOD_SERVICE_KEY=
-NAVER_CLIENT_ID=
-NAVER_CLIENT_SECRET=
-YOUTUBE_API_KEY=
-OPENAI_API_KEY=
+PUBLIC_DATA_SERVICE_KEY=your_public_data_service_key_here
+KMA_SERVICE_KEY=your_kma_service_key_here
+WILDFIRE_SERVICE_KEY=your_wildfire_service_key_here
+FLOOD_SERVICE_KEY=your_flood_service_key_here
+NAVER_CLIENT_ID=your_naver_client_id_here
+NAVER_CLIENT_SECRET=your_naver_client_secret_here
+YOUTUBE_API_KEY=your_youtube_api_key_here
+EVENT_MEDIA_TTL_MS=2592000000
+EVENT_IMAGE_SEARCH_TIMEOUT_MS=5000
+
+# AI RAG
+OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 OPENAI_LLM_MODEL=gpt-4o-mini
 OPENAI_API_BASE_URL=https://api.openai.com/v1
+AI_RAG_DUMMY_MODE=auto
+AI_RAG_AUTO_PUBLISH=true
+AI_RAG_AUTO_RUN_ON_EMPTY=true
+AI_RAG_ON_DEMAND_LIMIT=15
+AI_RAG_ON_DEMAND_CATALOG_LIMIT=15
+AI_RAG_REUSE_SAME_ORG=true
+AI_RAG_CROSS_EVENT_REPORT_TTL_MS=2592000000
+AI_RAG_DEFAULT_LIMIT=15
+AI_RAG_REPORT_TTL_MS=86400000
+AI_RAG_MOCK_CATEGORY_TTL_MS=259200000
+AI_RAG_REFRESH_ENABLED=true
+AI_RAG_REFRESH_INTERVAL_MS=21600000
+AI_RAG_REFRESH_STALE_MS=86400000
+AI_RAG_REFRESH_LIMIT=15
+AI_RAG_REFRESH_CATALOG_LIMIT=15
+AI_RAG_REFRESH_EVENT_LIMIT=10
+AI_RAG_REFRESH_COOLDOWN_MS=1800000
+PUBLIC_ORG_DISPLAY_LIMIT=3
+AI_RAG_MAX_SOURCE_CHARS=6000
+AI_RAG_OFFICIAL_SOURCE_LIMIT=1
+AI_RAG_SEARCH_QUERY_LIMIT=2
+AI_RAG_NEWS_DISPLAY=3
+AI_RAG_FETCH_TIMEOUT_MS=6000
+AI_RAG_SKIP_NEWS=false
+AI_RAG_FORCE_REFRESH=false
 ```
 
 Do not commit real `.env` values. Use `.env.example` for placeholders only.
