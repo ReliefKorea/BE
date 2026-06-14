@@ -28,6 +28,7 @@ const configuredDbPath = process.env.DB_PATH || process.env.DATABASE_PATH;
 const DB_PATH = configuredDbPath
   ? path.resolve(BACKEND_ROOT, configuredDbPath)
   : path.resolve(BACKEND_ROOT, 'data', 'disaster.sqlite');
+const SCHEMA_PATH = path.resolve(BACKEND_ROOT, 'db', 'schema.sql');
 const GDACS_API_URL = process.env.GDACS_API_URL || 'https://www.gdacs.org/xml/rss_7d.xml';
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
@@ -275,6 +276,19 @@ function run(db, sql, params = []) {
   });
 }
 
+function exec(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, error => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
 function closeDatabase(db) {
   return new Promise((resolve, reject) => {
     db.close(error => {
@@ -286,6 +300,20 @@ function closeDatabase(db) {
       resolve();
     });
   });
+}
+
+async function ensureDatabaseReady() {
+  await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
+
+  const schemaSql = await fs.readFile(SCHEMA_PATH, 'utf8');
+  const db = openWritableDatabase();
+
+  try {
+    await exec(db, schemaSql);
+    console.log(`Database ready: ${DB_PATH}`);
+  } finally {
+    await closeDatabase(db);
+  }
 }
 
 async function allOrEmpty(db, sql, params = []) {
@@ -2502,7 +2530,16 @@ function startOrgRagRefreshTimer() {
   }
 }
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Backend server running on http://0.0.0.0:${PORT}`);
-  startOrgRagRefreshTimer();
+async function startServer() {
+  await ensureDatabaseReady();
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Backend server running on http://0.0.0.0:${PORT}`);
+    startOrgRagRefreshTimer();
+  });
+}
+
+startServer().catch(error => {
+  console.error(`Server startup failed: ${error.message}`);
+  process.exit(1);
 });

@@ -88,6 +88,14 @@ Default local database:
 disaster.sqlite
 ```
 
+Railway SQLite database:
+
+```text
+DB_PATH=/data/disaster.sqlite
+```
+
+Create a Railway Volume on the `BE` service and mount it at `/data`. The server creates the parent directory and applies `db/schema.sql` at startup, so the database file can be created inside the mounted volume before API routes read it.
+
 ## Polling
 
 Run one polling cycle:
