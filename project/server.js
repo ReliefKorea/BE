@@ -1130,6 +1130,16 @@ function buildDynamicOfficialUpdates(event) {
         title: '산불 국민행동요령',
         summary: '산불 발생 시 산림과 불길에서 멀리 떨어지고, 재난문자와 지자체 안내를 확인하며, 안전한 장소로 대피해야 합니다.',
         original_link: safeKoreaGuideUrl('forestFires', '산불')
+      }),
+      officialUpdate({
+        update_id: `official_${stableSlug(eventId)}_wildfire_local_notice`,
+        event_id: eventId,
+        source_name: '관할 지자체',
+        source_type: '대피·통제 안내',
+        issued_at: event.updated_at,
+        title: '주민 대피 및 통행 통제 확인',
+        summary: `${event.region_name} 인근 주민은 지자체 재난문자와 현장 통제 안내를 우선 확인하고, 산림 인접 도로와 등산로 접근을 피해야 합니다.`,
+        original_link: safeKoreaGuideUrl('forestFires', '산불')
       })
     ];
   }
