@@ -121,37 +121,41 @@ const DEFAULT_ORG_RAG_REFRESH_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ORG_RAG_REFRESH_COOLDOWN_MS = 30 * 60 * 1000;
 const DEFAULT_EVENT_MEDIA_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_MOCK_CATEGORY_RAG_TTL_MS = 72 * 60 * 60 * 1000;
+const EVENT_MEDIA_CACHE_VERSION = 'v2';
+const EVENT_MEDIA_IMAGE_PARAMS = '?auto=format&fit=crop&w=1800&q=84';
 const CATEGORY_MEDIA_FALLBACKS = {
-  wildfire: {
-    image_url: 'https://images.unsplash.com/photo-1523712999610-f77fbcfc3843?auto=format&fit=crop&w=1800&q=84',
-    image_source_name: 'Unsplash',
-    image_source_url: 'https://unsplash.com',
-    image_alt: '산불 피해 지역의 숲과 연기'
-  },
-  earthquake: {
-    image_url: 'https://images.unsplash.com/photo-1518005020951-eccb494ad742?auto=format&fit=crop&w=1800&q=84',
-    image_source_name: 'Unsplash',
-    image_source_url: 'https://unsplash.com',
-    image_alt: '지진 피해 복구 지원이 필요한 도시 건물'
-  },
-  typhoon: {
-    image_url: 'https://images.unsplash.com/photo-1428592953211-077101b2021b?auto=format&fit=crop&w=1800&q=84',
-    image_source_name: 'Unsplash',
-    image_source_url: 'https://unsplash.com',
-    image_alt: '태풍과 집중호우로 비가 내리는 지역'
-  },
-  heavy_rain: {
-    image_url: 'https://images.unsplash.com/photo-1428592953211-077101b2021b?auto=format&fit=crop&w=1800&q=84',
-    image_source_name: 'Unsplash',
-    image_source_url: 'https://unsplash.com',
-    image_alt: '집중호우로 비가 내리는 지역'
-  },
-  default: {
-    image_url: 'https://images.unsplash.com/photo-1469571486292-0ba58a3f068b?auto=format&fit=crop&w=1800&q=84',
-    image_source_name: 'Unsplash',
-    image_source_url: 'https://unsplash.com',
-    image_alt: '재난 구호 활동에 참여하는 사람들'
-  }
+  wildfire: [
+    '1615092296061-e2ccfeb2f3d6', '1507680465142-ef2223e23308', '1619461129861-d0c1479c48b4',
+    '1634009653379-a97409ee15de', '1511027643875-5cbb0439c8f1', '1692364221415-654b20e6d1d2',
+    '1505017791108-7b40f307cdc5', '1473260079709-83c808703435', '1602980085374-7e743fff3cc6',
+    '1536245344390-dbf1df63c30a', '1611174797136-5e167ea90d6c'
+  ],
+  earthquake: [
+    '1677233860259-ce1a8e0f8498', '1621077742331-2df96a07cca7', '1603869311144-66b03d340b32',
+    '1617252820855-a829ba1babe7', '1641213131995-06e2cf0790d8', '1617585411149-54e9fdf60348',
+    '1677233861443-4aac86420db2', '1686620225824-d4120ed3a81e', '1702024249908-3d04f2c22d71',
+    '1677233859838-be47b0ab6c4a', '1647125849914-5238985ab21a'
+  ],
+  typhoon: [
+    '1454789476662-53eb23ba5907', '1641648543997-8244afb0eb86', '1600672202669-3521432b6302',
+    '1601110958456-0bee398ce406', '1641648542860-4937848433cf', '1641648542375-ed3f5c6dd052',
+    '1676900894925-d39174ba74db', '1656495782911-06e6a5f9bef5', '1533922115281-16a28dffcc2e',
+    '1641648542179-5fe991ff96e9', '1641648542473-0b4e73fe2e2b'
+  ],
+  heavy_rain: [
+    '1547683905-f686c993aae5', '1600336153113-d66c79de3e91', '1485617359743-4dc5d2e53c89',
+    '1604275689235-fdc521556c16', '1558448495-5ef3fce92344', '1657069345471-c54f2432b79c',
+    '1612038385745-53cfb4fbd19b', '1541710005980-7ea80ff232d6', '1581059686229-de26e6ae5dc4',
+    '1657069342866-2d11c2509b02', '1617494532490-297fc0eb515e'
+  ],
+  default: ['1469571486292-0ba58a3f068b']
+};
+const CATEGORY_MEDIA_ALT = {
+  wildfire: '산불 피해 현장',
+  earthquake: '지진 피해와 안전 점검 현장',
+  typhoon: '태풍과 강풍 피해 현장',
+  heavy_rain: '집중호우와 침수 피해 현장',
+  default: '재난 구호 활동 현장'
 };
 const ORGANIZATION_MEDIA_FALLBACKS = [
   {
@@ -362,6 +366,7 @@ async function ensureDatabaseReady() {
 
   try {
     await exec(db, schemaSql);
+    await run(db, 'DELETE FROM event_media_cache WHERE cache_key NOT LIKE ?', [`${EVENT_MEDIA_CACHE_VERSION}_%`]);
     console.log(`Database ready: ${DB_PATH}`);
   } finally {
     await closeDatabase(db);
@@ -823,7 +828,7 @@ function disasterTypeLabel(disasterType) {
 
 function eventMediaCacheKey({ eventId, category, region, isMock }) {
   const scope = isMock ? 'category' : 'event';
-  return `${scope}_${stableCacheSlug(eventId || category)}_${stableCacheSlug(region || 'all')}`.slice(0, 180);
+  return `${EVENT_MEDIA_CACHE_VERSION}_${scope}_${stableCacheSlug(eventId || category)}_${stableCacheSlug(region || 'all')}`.slice(0, 180);
 }
 
 function mapEventMedia(row) {
@@ -839,11 +844,26 @@ function mapEventMedia(row) {
   };
 }
 
-function fallbackEventMedia(category, eventTitle = '') {
-  const fallback = CATEGORY_MEDIA_FALLBACKS[category] || CATEGORY_MEDIA_FALLBACKS.default;
+function stableMediaIndex(value, length) {
+  let hash = 2166136261;
+  for (const character of text(value)) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % length;
+}
+
+function fallbackEventMedia(event) {
+  const category = supportedDisasterType(event.disaster_type) || 'default';
+  const options = CATEGORY_MEDIA_FALLBACKS[category] || CATEGORY_MEDIA_FALLBACKS.default;
+  const imageId = options[stableMediaIndex(`${event.event_id}:${event.region_name}`, options.length)];
+  const imageAlt = CATEGORY_MEDIA_ALT[category] || CATEGORY_MEDIA_ALT.default;
+
   return {
-    ...fallback,
-    image_alt: eventTitle ? `${eventTitle} 관련 ${fallback.image_alt}` : fallback.image_alt,
+    image_url: `https://images.unsplash.com/photo-${imageId}${EVENT_MEDIA_IMAGE_PARAMS}`,
+    image_source_name: 'Unsplash',
+    image_source_url: 'https://unsplash.com',
+    image_alt: event.title ? `${event.title} 관련 ${imageAlt}` : imageAlt,
     query: '',
     is_fallback: true
   };
@@ -880,7 +900,7 @@ async function searchEventImage(event) {
   ].filter(Boolean).join(' ');
   const url = new URL('https://openapi.naver.com/v1/search/image');
   url.searchParams.set('query', query);
-  url.searchParams.set('display', '10');
+  url.searchParams.set('display', '30');
   url.searchParams.set('sort', 'sim');
   url.searchParams.set('filter', 'large');
 
@@ -893,10 +913,28 @@ async function searchEventImage(event) {
       }
     });
     const items = Array.isArray(response.data?.items) ? response.data.items : [];
-    const selected = items.find(item => {
+    const candidates = items.filter((item, index, list) => {
       const imageUrl = text(item?.link);
-      return /^https?:\/\//.test(imageUrl) && !/\.(gif|svg)(\?|$)/i.test(imageUrl);
+      return /^https?:\/\//.test(imageUrl)
+        && !/\.(gif|svg)(\?|$)/i.test(imageUrl)
+        && list.findIndex(candidate => text(candidate?.link) === imageUrl) === index;
     });
+    const db = openDatabase();
+    let usedUrls = [];
+
+    try {
+      usedUrls = (await allOrEmpty(
+        db,
+        'SELECT image_url FROM event_media_cache WHERE event_id <> ?',
+        [event.event_id]
+      )).map(row => text(row.image_url));
+    } finally {
+      await closeDatabase(db);
+    }
+
+    const unusedCandidates = candidates.filter(item => !usedUrls.includes(text(item.link)));
+    const selected = unusedCandidates[0]
+      || candidates[stableMediaIndex(`${event.event_id}:${event.region_name}:${event.title}`, candidates.length)];
 
     if (!selected) return null;
 
@@ -998,7 +1036,7 @@ async function readEventMedia(request) {
     return mapEventMedia(cached);
   }
 
-  const media = searched || fallbackEventMedia(event.disaster_type, event.title);
+  const media = searched || fallbackEventMedia(event);
   return upsertEventMedia(
     cacheKey,
     event,
@@ -2715,7 +2753,18 @@ app.get('/api/orgs/:orgId', async (req, res) => {
       return;
     }
 
-    res.json(organization);
+    const events = await readEvents();
+    const event = events.find(item => item.event_id === organization.event_id);
+
+    if (event) {
+      maybeScheduleOrgRagRefreshForEvent(event.event_id, 1).catch(error => {
+        console.error(`Organization page RAG refresh check failed for ${event.event_id}:`, error.message);
+      });
+    }
+
+    res.json(event
+      ? enrichOrganizationRecommendation(organization, event)
+      : organization);
   } catch (error) {
     console.error('Error reading organization:', error.message);
     res.status(500).json({
